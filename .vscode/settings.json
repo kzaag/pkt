@@ -1,0 +1,11 @@
+{
+    "files.associations": {
+        "stddef.h": "c",
+        "if_ppp.h": "c",
+        "ppp-ioctl.h": "c",
+        "ppp_defs.h": "c",
+        "ipv6.h": "c",
+        "ip.h": "c",
+        "stdlib.h": "c"
+    }
+}
