@@ -51,7 +51,7 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 #define COUNT_COL_IX   1
 #define COUNT_COL_SZ   8
 #define SIZE_COL_IX    2
-#define SIZE_COL_SZ    7
+#define SIZE_COL_SZ    8
 
 #define MAX_FACTS      2
 
@@ -142,13 +142,13 @@ char summary_buff[MAX_SUMMARY_LEN];
 char* 
 snprintf_size(char *buf, int blen, double size) {
     int i = 0;
-    const char* units[] = {"B", "K", "M", "G", "T", "P"};
+    const char units[] = {'B', 'K', 'M', 'G', 'T', 'P'};
     while (size > 1024) {
-        size /= 1024;
         if(i == 5) break;
+        size /= 1024;
         i++;
     }
-    snprintf(buf, blen, "%.*lf%s", i, size, units[i]);
+    snprintf(buf, blen, "%.*lf%c", i, size, units[i]);
     return buf;
 }
 
@@ -158,6 +158,7 @@ double atof_size(char * sizestr) {
     if(sscanf(sizestr, "%lf%c", &sz, &d) != 2) {
         return 0;
     }
+
     switch(d) {
     case 'P':
         sz *= 1024;
@@ -169,9 +170,8 @@ double atof_size(char * sizestr) {
         sz *= 1024;
     case 'K':
         sz *= 1024;
-        break;
-    /* case 'B': */
     }
+
     return sz;
 }
 
@@ -358,8 +358,8 @@ void initbl(struct table * t) {
         } else {
             row[COUNT_COL_IX] = malloc(COUNT_COL_SZ + 1);
             row[COUNT_COL_IX][COUNT_COL_SZ] = 0;
-            row[SIZE_COL_IX] = malloc(SIZE_COL_IX + 1);
-            row[SIZE_COL_IX][SIZE_COL_IX] = 0;
+            row[SIZE_COL_IX] = malloc(SIZE_COL_SZ + 1);
+            row[SIZE_COL_IX][SIZE_COL_SZ] = 0;
         }
     }
 }
