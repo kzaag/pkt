@@ -10,6 +10,10 @@
 
 #include "pkt_digest.h"
 
+/* unlikely ip addresses which we may use for testing */
+
+#define INADDR_TEST_NET_1 ((in_addr_t)0xc0000200) /* 192.0.2.0 */
+
 static char pcaperr[PCAP_ERRBUF_SIZE];
 
 #define print_errno(hdr) fprintf(stderr, #hdr " %s\n", errno ? strerror(errno) : "unkown error");
@@ -49,11 +53,20 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 #define COUNT_CIX 3
 #define SIZE_CIX  4
 
+#define CT_CSTR   0
+#define CT_DOUBLE 1
+#define CT_UINT64 2
+#define CT_INADDR 3
+
 struct colspec {
-    uint16_t max_size;
     char * hdr;
-    u_char visible;
+    uint16_t max_size;
     uint16_t c_size;
+    u_char coltype;
+    u_char visible  : 1;
+    /* if set to 0 will indicate that column value may change, 
+        and cstr must be updated on every display */
+    u_char readonly : 1;
 } colspec [] = {
     /* dims - not visible by default */
     {
@@ -61,21 +74,27 @@ struct colspec {
         .c_size = 4,
         /* XXXX-YYYY-ZZZZ\0 */
         .max_size = MAX_SUMMARY_LEN,
+        .coltype = CT_CSTR,
         .visible = 0,
+        .readonly = 1,
     },
     {         
         .hdr = "IP4SADDR",
         .c_size = 10,
         /* xxx.xxx.xxx.xxx\0 */
         .max_size = 16,
+        .coltype = CT_INADDR,
         .visible = 0,
+        .readonly = 1,
     },
     {         
         .hdr = "IP4DADDR",
         .c_size = 10,
         /* xxx.xxx.xxx.xxx\0 */
         .max_size = 16,
+        .coltype = CT_INADDR,
         .visible = 0,
+        .readonly = 1,
     },
     /* facts - visible by default */
     {
@@ -83,14 +102,18 @@ struct colspec {
         .c_size = 6,
         /* XXXXXXXXX\0 */
         .max_size = 10,
+        .coltype = CT_UINT64,
         .visible = 1,
+        .readonly = 0,
     },
     {
         .hdr = "SIZE",
         .c_size = 5,
         /* XXXXX.XX{B,K,M,...}\0 */
         .max_size = 10,
+        .coltype = CT_DOUBLE,
         .visible = 1,
+        .readonly = 0,
     },
 };
 
@@ -101,6 +124,10 @@ struct colspec {
 #define CVIS(IX) colspec[IX].visible
 /* current column size */
 #define CCSZ(IX) colspec[IX].c_size
+/* column type */
+#define CTP(IX) colspec[IX].coltype
+/* is column readonly */
+#define CRDONLY(IX) colspec[IX].readonly
 
 struct {
     // device, for example:
@@ -164,9 +191,8 @@ int init_opts(int argc, char * argv[])
 struct td {
     char * cstr;
     union {
-        double   double_val;
         uint64_t uint64_val;
-        in_addr_t in_addr_val;
+        struct in_addr in_addr_val;
     };
 };
 
@@ -239,9 +265,7 @@ void upsert(struct table * t, struct pkt_digest * dg, uint32_t len) {
     if(pthread_spin_lock(&globals.sync)) 
         print_errno_exit(upsert:)
 
-    uint64_t c;
-    double sz;
-    int wrote, sumwrote;
+    int sumwrote;
 
     if(CVIS(SUMMARY_CIX)) {
         sumwrote = sprintf_pkg_summary(summary_buff, dg) + 1;
@@ -262,29 +286,20 @@ void upsert(struct table * t, struct pkt_digest * dg, uint32_t len) {
         
         if(CVIS(IP4SADDR_CIX)) {
             if(ispv4) {
-                if(dg->ipv4.saddr.s_addr != t->data[i][IP4SADDR_CIX].in_addr_val)
+                if(dg->ipv4.saddr.s_addr != t->data[i][IP4SADDR_CIX].in_addr_val.s_addr)
                     continue;
             } else {
-                if(INADDR_ANY != t->data[i][IP4SADDR_CIX].in_addr_val)
+                if(INADDR_TEST_NET_1 != t->data[i][IP4SADDR_CIX].in_addr_val.s_addr)
                     continue;
             }
         }
 
         if(CVIS(COUNT_CIX)) {
             t->data[i][COUNT_CIX].uint64_val++;
-            c = t->data[i][COUNT_CIX].uint64_val;
-            wrote = snprintf(t->data[i][COUNT_CIX].cstr, MCSZ(COUNT_CIX), "%lu", c) + 1;
-            if(wrote > CCSZ(COUNT_CIX))
-                CCSZ(COUNT_CIX) = wrote;
         }
 
         if(CVIS(SIZE_CIX)) {
-            //sz = atof_size(t->data[i][SIZE_CIX].cstr);
-            t->data[i][SIZE_CIX].double_val+=(double)len;
-            sz = t->data[i][SIZE_CIX].double_val;
-            wrote = snprintf_size(t->data[i][SIZE_CIX].cstr, MCSZ(SIZE_CIX), sz) + 1;
-            if(wrote > CCSZ(SIZE_CIX))
-                CCSZ(SIZE_CIX) = wrote;
+            t->data[i][SIZE_CIX].uint64_val += len;
         }
 
         pthread_spin_unlock(&globals.sync);
@@ -298,34 +313,18 @@ void upsert(struct table * t, struct pkt_digest * dg, uint32_t len) {
 
     if(CVIS(IP4SADDR_CIX)) {
         if(ispv4) {
-            t->data[t->rows][IP4SADDR_CIX].in_addr_val = dg->ipv4.saddr.s_addr;
-            wrote = snprintf(
-                t->data[t->rows][IP4SADDR_CIX].cstr, 
-                MCSZ(IP4SADDR_CIX), 
-                "%s", inet_ntoa(dg->ipv4.saddr))  + 1;
+            t->data[t->rows][IP4SADDR_CIX].in_addr_val = dg->ipv4.saddr;
         } else {
-            t->data[t->rows][IP4SADDR_CIX].in_addr_val = INADDR_ANY;
-            wrote = snprintf(
-                t->data[t->rows][IP4SADDR_CIX].cstr,
-                MCSZ(IP4SADDR_CIX),
-                "?")  + 1;
+            t->data[t->rows][IP4SADDR_CIX].in_addr_val.s_addr = INADDR_TEST_NET_1;
         }
-        if(wrote > CCSZ(IP4SADDR_CIX))
-            CCSZ(IP4SADDR_CIX) = wrote;
     }
 
     if(CVIS(COUNT_CIX)) {
-        /* this is never bigger than current CCSZ*/
-        t->data[t->rows][COUNT_CIX].cstr[0] = '1';
-        t->data[t->rows][COUNT_CIX].cstr[1] = 0;
         t->data[t->rows][COUNT_CIX].uint64_val = 1;
     }
 
     if(CVIS(SIZE_CIX)) {
-        t->data[t->rows][SIZE_CIX].uint64_val = (double)len;
-        wrote = snprintf_size(t->data[t->rows][SIZE_CIX].cstr, MCSZ(SIZE_CIX), (double)len) + 1;
-        if(wrote > CCSZ(SIZE_CIX))
-            CCSZ(SIZE_CIX) = wrote;
+        t->data[t->rows][SIZE_CIX].uint64_val = len;
     }
 
     if(CVIS(SUMMARY_CIX)) {
@@ -368,6 +367,7 @@ int get_device_info() {
     fprintf(stderr, "get_device_info: couldnt find device\n");
     return 1;
 }
+
 
 /*
     since pcap will run rcv_pkt in single thread it should be ok to
@@ -428,14 +428,55 @@ void cleanup()
 }
 
 void printbl(struct table * t) {
+    int wrote;
+    unsigned short csz;
     
     tgotoxy(0, 1);
-    unsigned short csz;
     
     for(size_t i = 0; i < t->rows; i++) {
         for(size_t j = 0; j < t->cols; j++) {
-            if(!t->data[i][j].cstr)
+
+            if(!t->data[i][j].cstr) 
                 continue;
+
+            if(!t->data[i][j].cstr[0] || (!CRDONLY(j) && i > 0)) {
+
+                switch(CTP(j)) {
+                case CT_DOUBLE:
+                    wrote = snprintf_size(
+                        t->data[i][j].cstr, 
+                        MCSZ(j), (double)t->data[i][j].uint64_val);
+                    break;
+                case CT_INADDR:
+
+                    if(t->data[i][j].in_addr_val.s_addr == INADDR_TEST_NET_1) {
+                        wrote = sprintf(t->data[i][j].cstr, "?");
+                    } else {
+                        wrote = snprintf(
+                            t->data[i][j].cstr, 
+                            MCSZ(IP4SADDR_CIX), 
+                            inet_ntoa(t->data[i][j].in_addr_val));
+                    }
+
+                    break;
+                case CT_UINT64:
+                    wrote = snprintf(
+                        t->data[i][j].cstr, 
+                        MCSZ(j), 
+                        "%lu", t->data[i][j].uint64_val);
+
+                    break;
+                default:
+
+                    wrote = sprintf(t->data[i][j].cstr, "?");
+                    break;
+                }
+
+                wrote++;
+                if(wrote > CCSZ(j))
+                    CCSZ(j) = wrote;
+            }
+
             csz = CCSZ(j);
             printf("%*.*s", csz, csz, t->data[i][j].cstr);
         }
@@ -464,6 +505,7 @@ void initbl(struct table * t) {
                 row[j].cstr = colspec[j].hdr;
             } else {
                 row[j].cstr = malloc(colspec[j].max_size);
+                row[j].cstr[0] = 0;
             }
         }
     }
