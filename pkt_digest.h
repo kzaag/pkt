@@ -29,6 +29,8 @@ struct pkt_meta {
     pktcallback nexthop;
 };
 
+/* because summary is of format: XXXX-YYYY-ZZZZ-.... */
+#define MAX_SUMMARY_LEN (5 * MAX_PROTO_LEN)
 
 struct pkt_digest
 {

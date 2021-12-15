@@ -163,14 +163,18 @@ const char * PROTO_ID_STR[] = {
 };
 
 
-// s length must be >= (5 * MAX_PROTO_LEN)
+// s length must be >= (MAX_SUMMARY_LEN)
 void sprintf_pkg_summary(char * s, struct pkt_digest * pi) {
+    if(!pi->meta.proto_len) {
+        s[0] = 0;
+        return;
+    }
     for(PROTO_ID i = 0; i < pi->meta.proto_len; i++) {
         const char * proto = PROTO_ID_STR[pi->meta.protos[i]];
         if(i < pi->meta.proto_len - 1)
-            sprintf("%s-", proto);
+            s += sprintf(s, "%s-", proto);
         else 
-            printf("%s", proto);
+            s += sprintf(s, "%s", proto);
     }
 }
 

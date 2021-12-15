@@ -9,6 +9,32 @@
 
 #include "pkt_digest.h"
 
+static char pcaperr[PCAP_ERRBUF_SIZE];
+
+#define print_errno(hdr) fprintf(stderr, #hdr " %s\n", errno ? strerror(errno) : "unkown error");
+#define print_errno_ret(hdr) { \
+    print_errno(hdr);            \
+    return 1;                       \
+}
+#define print_errno_exit(hdr) {     \
+    print_errno(hdr);                \
+    exit(1);                         \
+}
+
+#define print_pcap_err(hdr) fprintf(stderr, #hdr " %s\n", pcaperr);
+// print_pcap_err and return 1
+#define print_pcap_err_ret(hdr) { \
+    print_pcap_err(hdr);            \
+    return 1;                       \
+}
+
+#define print_err_ret(err) { \
+    fputs(#err "\n", stderr);   \
+    return 1;              \
+}
+
+#define MAX_KEY_SIZE MAX_SUMMARY_LEN
+
 
 // clean terminal
 #define tclean() printf("\033[H\033[J")
@@ -21,21 +47,38 @@ struct {
     // -d ppp0
     // -d lo
     char * d;
+    uint32_t g_num;
     uint32_t g_summary;
 } opts = {
     .d = NULL,
     .g_summary = 0,
+    .g_num = 0,
 };
 
 int init_opts(int argc, char * argv[])
 {
     int o;
+    size_t i = 0;
 
-    while((o = getopt(argc, argv, "d:")) != -1) {
+    while((o = getopt(argc, argv, "d:g:")) != -1) {
         switch(o) {
         case 'd':
             opts.d = strdup(optarg);
             break;
+        case 'g':
+            for(;;) {
+                if(!optarg[i]) break;
+                switch(optarg[i]) {
+                case 's':
+                    opts.g_num++;
+                    opts.g_summary = 1; 
+                    break;
+                default:
+                    fprintf(stderr, "%s: unkown group option -- %c\n", argv[0], optarg[i]);
+                    break;
+                }
+                i++;
+            }
         }
     }
 
@@ -68,27 +111,7 @@ struct globals {
     },
 };
 
-static char pcaperr[PCAP_ERRBUF_SIZE];
-
-#define print_errno(hdr) fprintf(stderr, #hdr " %s\n", errno ? strerror(errno) : "unkown error");
-#define print_errno_ret(hdr) { \
-    print_errno(hdr);            \
-    return 1;                       \
-}
-
-#define print_pcap_err(hdr) fprintf(stderr, #hdr " %s\n", pcaperr);
-// print_pcap_err and return 1
-#define print_pcap_err_ret(hdr) { \
-    print_pcap_err(hdr);            \
-    return 1;                       \
-}
-
-#define print_err_ret(err) { \
-    fputs(#err "\n", stderr);   \
-    return 1;              \
-}
-
-char summary_buff[5 * MAX_PROTO_LEN];
+char summary_buff[MAX_SUMMARY_LEN];
 
 void upsert(struct table * t, struct pkt_digest * dg) {
 
@@ -99,15 +122,20 @@ void upsert(struct table * t, struct pkt_digest * dg) {
     for(size_t i = 0; i < t->len; i++) {
         if(opts.g_summary && strcmp(summary_buff, t->rows[i].keys[0]))
             continue;
+
+        printf("update %s=%lu\n", summary_buff, t->rows[i].count + 1);
+
         t->rows[i].count++;
         return;
     }
 
     if(t->len >= t->cap) return;
 
-    t->rows[t->len++].count = 1;
+    printf("insert %s=1\n", summary_buff);
+    t->rows[t->len].count = 1;
     if(opts.g_summary)
-        strcpy(t->rows[t->len++].keys[0], summary_buff);
+        strcpy(t->rows[t->len].keys[0], summary_buff);
+    t->len++;
 }
 
 int get_device_info() {
@@ -138,14 +166,6 @@ int get_device_info() {
 
     fprintf(stderr, "get_device_info: couldnt find device\n");
     return 1;
-}
-
-void cleanup()
-{
-    puts("cleanup...");
-    if(opts.d) free(opts.d);
-    if(globals.pcap_handle) pcap_close(globals.pcap_handle);
-    if(globals.t.rows) free(globals.t.rows);
 }
 
 /*
@@ -180,12 +200,39 @@ void rcv_pkt(u_char * const args, const struct pcap_pkthdr * const _h, const u_c
     upsert(&globals.t, &pkt_buffer);
 }
 
+void cleanup()
+{
+    puts("cleanup...");
+    if(opts.d) free(opts.d);
+    if(globals.pcap_handle) {
+        pcap_breakloop(globals.pcap_handle);
+        pcap_close(globals.pcap_handle);
+    }
+    if(globals.t.rows) {
+        for(size_t i = 0; i < globals.t.cap; i++) {
+            for(size_t j = 0; j < opts.g_num; j++) {
+                free(globals.t.rows[i].keys[j]);
+            }
+            free(globals.t.rows[i].keys);
+        }
+        free(globals.t.rows);
+    }
+    puts("done");
+    exit(0);
+}
+
 void initabl(struct table * t) {
     t->cap = 30;
     t->len = 0;
     t->rows = malloc(sizeof(struct table_row) * t->cap);
+    if(!t->rows) print_errno_exit(malloc rows:)
     for(size_t i = 0 ; i < t->cap; i++) {
-        t->rows[i].keys = malloc()
+        t->rows[i].keys = malloc(sizeof(char *) * opts.g_num);
+        if(!t->rows[i].keys) print_errno_exit(malloc keys:)
+        for(size_t j = 0; j < opts.g_num; j++) {
+            t->rows[i].keys[j] = malloc(MAX_KEY_SIZE);
+            if(!t->rows[i].keys[j]) print_errno_exit(malloc key:)
+        }
     }
 }
 
@@ -219,6 +266,8 @@ int main(int argc, char *argv[])
 
     tclean();
     tsetnowrap();
+
+    initabl(&globals.t);
 
     if(pcap_loop(globals.pcap_handle, -1, rcv_pkt, NULL)) print_errno_ret(pcap_loop:)
 
