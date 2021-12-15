@@ -94,7 +94,7 @@ struct pkt_digest
     // } icmp;
 };
 
-void sprintf_pkg_summary(char * s, struct pkt_digest * pi);
+int sprintf_pkg_summary(char * s, struct pkt_digest * pi);
 
 void rcv_dlt_en10mb(const u_char ** p, u_int32_t * plen, struct pkt_digest * i);
 void rcv_dlt_linux_sll(const u_char ** p, u_int32_t * plen, struct pkt_digest * i);

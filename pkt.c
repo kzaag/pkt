@@ -41,19 +41,45 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 // set cursor position
 #define tgotoxy(x, y) printf("\033[%d;%dH", x, y)
 
+/* indexes for specified columns within colspec */
+#define SUMMARY_CIX   0
+#define COUNT_CIX 1
+#define SIZE_CIX  2
 
-#define SUMMARY_COL_IX 0
-#define SUMMARY_COL_SZ MAX_SUMMARY_LEN
+struct colspec {
+    uint16_t max_size;
+    char * hdr;
+    u_char visible;
+    uint16_t c_size;
+} colspec [] = {
+    /* dims - not visible by default */
+    {
+        .hdr = "SUM",
+        .c_size = 4,
+        .max_size = MAX_SUMMARY_LEN,
+        .visible = 0,
+    },
+    /* facts - visible by default */
+    {
+        .hdr = "COUNT",
+        .c_size = 6,
+        .max_size = 10,
+        .visible = 1,
+    },
+    {
+        .hdr = "SIZE",
+        .c_size = 5,
+        .max_size = 10,
+        .visible = 1,
+    }
+};
 
-#define MAX_GRPS 1
-
-
-#define COUNT_COL_IX   1
-#define COUNT_COL_SZ   8
-#define SIZE_COL_IX    2
-#define SIZE_COL_SZ    8
-
-#define MAX_FACTS      2
+/* max column size */
+#define MCSZ(IX) colspec[IX].max_size
+/* is column visible */
+#define CVIS(IX) colspec[IX].visible
+/* current column size */
+#define CCSZ(IX) colspec[IX].c_size
 
 struct {
     // device, for example:
@@ -87,6 +113,7 @@ int init_opts(int argc, char * argv[])
                 switch(optarg[i]) {
                 case 's':
                     opts.g_summary = 1; 
+                    CVIS(SUMMARY_CIX) = 1;
                     break;
                 default:
                     fprintf(stderr, "%s: unkown group option -- %c\n", argv[0], optarg[i]);
@@ -116,7 +143,6 @@ struct table {
     unsigned short maxrows;
     unsigned short rows;
     unsigned short cols;
-    unsigned short * max_col_sz;
 };
 
 struct globals {
@@ -139,7 +165,7 @@ struct globals {
 
 char summary_buff[MAX_SUMMARY_LEN];
 
-char* 
+int
 snprintf_size(char *buf, int blen, double size) {
     int i = 0;
     const char units[] = {'B', 'K', 'M', 'G', 'T', 'P'};
@@ -148,8 +174,8 @@ snprintf_size(char *buf, int blen, double size) {
         size /= 1024;
         i++;
     }
-    snprintf(buf, blen, "%.*lf%c", i, size, units[i]);
-    return buf;
+    if(i > 2) i = 2;
+    return snprintf(buf, blen, "%.*lf%c", i, size, units[i]);
 }
 
 double atof_size(char * sizestr) {
@@ -180,22 +206,38 @@ void upsert(struct table * t, struct pkt_digest * dg, uint32_t len) {
     if(pthread_spin_lock(&globals.sync)) 
         print_errno_exit(upsert:)
 
-    if(opts.g_summary) {
-        sprintf_pkg_summary(summary_buff, dg);
-    }
-
     uint64_t c;
     double sz;
+    int wrote;
+    int sumwrote;
+
+    if(CVIS(SUMMARY_CIX)) {
+        sumwrote = sprintf_pkg_summary(summary_buff, dg) + 1;
+    }
+
 
     for(size_t i = 1; i < t->rows; i++) {
-        if(opts.g_summary && strcmp(summary_buff, t->data[i][SUMMARY_COL_IX]))
+
+        /* dims */
+
+        if(CVIS(SUMMARY_CIX) && strcmp(summary_buff, t->data[i][SUMMARY_CIX]))
             continue;
 
-        c = atoi(t->data[i][COUNT_COL_IX]);
-        sz = 0;
-        snprintf(t->data[i][COUNT_COL_IX], COUNT_COL_SZ, "%lu", c+1);
-        sz = atof_size(t->data[i][SIZE_COL_IX]);
-        snprintf_size(t->data[i][SIZE_COL_IX], SIZE_COL_SZ, sz + (double)len);
+        /* facts */
+
+        if(CVIS(COUNT_CIX)) {
+            c = atoi(t->data[i][COUNT_CIX]);
+            wrote = snprintf(t->data[i][COUNT_CIX], MCSZ(COUNT_CIX), "%lu", c+1) + 1;
+            if(wrote > CCSZ(COUNT_CIX))
+                CCSZ(COUNT_CIX) = wrote;
+        }
+
+        if(CVIS(SIZE_CIX)) {
+            sz = atof_size(t->data[i][SIZE_CIX]);
+            wrote = snprintf_size(t->data[i][SIZE_CIX], MCSZ(SIZE_CIX), sz + (double)len) + 1;
+            if(wrote > CCSZ(SIZE_CIX))
+                CCSZ(SIZE_CIX) = wrote;
+        }
 
         pthread_spin_unlock(&globals.sync);
         return;
@@ -206,11 +248,21 @@ void upsert(struct table * t, struct pkt_digest * dg, uint32_t len) {
         return;
     }
 
-    t->data[t->rows][COUNT_COL_IX][0] = '1';
-    t->data[t->rows][COUNT_COL_IX][1] = 0;
-    snprintf_size(t->data[t->rows][SIZE_COL_IX], SIZE_COL_SZ, (double)len);
-    if(opts.g_summary)
-        strncpy(t->data[t->rows][SUMMARY_COL_IX], summary_buff, SUMMARY_COL_SZ);
+    if(CVIS(COUNT_CIX)) {
+        /* this is never bigger than current CCSZ*/
+        t->data[t->rows][COUNT_CIX][0] = '1';
+        t->data[t->rows][COUNT_CIX][1] = 0;
+    }
+    if(CVIS(SIZE_CIX)) {
+        wrote = snprintf_size(t->data[t->rows][SIZE_CIX], MCSZ(SIZE_CIX), (double)len) + 1;
+        if(wrote > CCSZ(SIZE_CIX))
+            CCSZ(SIZE_CIX) = wrote;
+    }
+    if(CVIS(SUMMARY_CIX)) {
+        strncpy(t->data[t->rows][SUMMARY_CIX], summary_buff, MCSZ(SUMMARY_CIX));
+        if(sumwrote > CCSZ(SUMMARY_CIX))
+            CCSZ(SUMMARY_CIX) = sumwrote;
+    }
     t->rows++;
 
     pthread_spin_unlock(&globals.sync);
@@ -278,9 +330,11 @@ void rcv_pkt(u_char * const args, const struct pcap_pkthdr * const _h, const u_c
     upsert(&globals.t, &pkt_buffer, _h->len);
 }
 
+const char ct[] = "cleanup... ";
+
 void cleanup()
 {
-    puts("cleanup...");
+    write(STDOUT_FILENO, ct, sizeof(ct));
     if(opts.d) free(opts.d);
     if(globals.rthr) pthread_cancel(globals.rthr);
     if(globals.pcap_handle) {
@@ -297,7 +351,6 @@ void cleanup()
             free(globals.t.data[i]);
         }
         free(globals.t.data);
-        free(globals.t.max_col_sz);
     }
     puts("done");
     exit(0);
@@ -305,16 +358,6 @@ void cleanup()
 
 void printbl(struct table * t) {
     
-    for(size_t i = 0; i < t->rows; i++) {
-        for(size_t j = 0; j < t->cols; j++) {
-            char * cell = t->data[i][j];
-            if(!cell) continue;
-            size_t s = strlen(cell) + 1;
-            if(s > t->max_col_sz[j])
-                t->max_col_sz[j] = (unsigned short)s;
-        }
-    }
-
     tgotoxy(0, 1);
     unsigned short csz;
     
@@ -322,7 +365,7 @@ void printbl(struct table * t) {
         for(size_t j = 0; j < t->cols; j++) {
             if(!t->data[i][j])
                 continue;
-            csz = t->max_col_sz[j];
+            csz = CCSZ(j);
             printf("%*.*s", csz, csz, t->data[i][j]);
         }
         puts("");
@@ -336,30 +379,21 @@ void initbl(struct table * t) {
     t->maxrows = maxcap + 1;
     /* 1 because of header row */
     t->rows = 1;
-    t->cols = MAX_GRPS + MAX_FACTS;
+    t->cols = sizeof(colspec)/sizeof(struct colspec);
     
     t->data = malloc(sizeof(char **) * t->maxrows);
-    t->max_col_sz = calloc(t->cols, sizeof(int));
     for(size_t i = 0; i < t->maxrows; i++) {
         t->data[i] = calloc(t->cols, sizeof(char *));
         char ** row = t->data[i];
-        if(opts.g_summary) {
+
+        for(size_t j = 0; j < t->cols; j++) {
+            if(!colspec[j].visible) 
+                continue;
             if(i == 0) {
-                row[SUMMARY_COL_IX] = "SUM";
+                row[j] = colspec[j].hdr;
             } else {
-                row[SUMMARY_COL_IX] = malloc(SUMMARY_COL_SZ + 1);
-                row[SUMMARY_COL_IX][SUMMARY_COL_SZ] = 0;
+                row[j] = malloc(colspec[j].max_size);
             }
-        }
-        
-        if(i == 0) {
-            row[COUNT_COL_IX] = "COUNT";
-            row[SIZE_COL_IX] = "SIZE";
-        } else {
-            row[COUNT_COL_IX] = malloc(COUNT_COL_SZ + 1);
-            row[COUNT_COL_IX][COUNT_COL_SZ] = 0;
-            row[SIZE_COL_IX] = malloc(SIZE_COL_SZ + 1);
-            row[SIZE_COL_IX][SIZE_COL_SZ] = 0;
         }
     }
 }
