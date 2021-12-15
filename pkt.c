@@ -43,44 +43,55 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 
 /* indexes for specified columns within colspec */
 #define SUMMARY_CIX   0
-#define COUNT_CIX 1
-#define SIZE_CIX  2
+#define IP4SADDR_CIX  1
+#define IP4DADDR_CIX  2
 
-/* td types */
-// #define TDT_CHARPTR 0
-// #define TDT_DOUBLE  1
-// #define TDT_UINT64  2
+#define COUNT_CIX 3
+#define SIZE_CIX  4
 
 struct colspec {
     uint16_t max_size;
     char * hdr;
     u_char visible;
     uint16_t c_size;
-    //u_char td_type;
 } colspec [] = {
     /* dims - not visible by default */
     {
         .hdr = "SUM",
         .c_size = 4,
+        /* XXXX-YYYY-ZZZZ\0 */
         .max_size = MAX_SUMMARY_LEN,
         .visible = 0,
-        //.td_type = TDT_CHARPTR
+    },
+    {         
+        .hdr = "IP4SADDR",
+        .c_size = 10,
+        /* xxx.xxx.xxx.xxx\0 */
+        .max_size = 16,
+        .visible = 0,
+    },
+    {         
+        .hdr = "IP4DADDR",
+        .c_size = 10,
+        /* xxx.xxx.xxx.xxx\0 */
+        .max_size = 16,
+        .visible = 0,
     },
     /* facts - visible by default */
     {
         .hdr = "COUNT",
         .c_size = 6,
+        /* XXXXXXXXX\0 */
         .max_size = 10,
         .visible = 1,
-        //.td_type = TDT_UINT64,
     },
     {
         .hdr = "SIZE",
         .c_size = 5,
+        /* XXXXX.XX{B,K,M,...}\0 */
         .max_size = 10,
         .visible = 1,
-        //.td_type = TDT_DOUBLE,
-    }
+    },
 };
 
 
@@ -100,10 +111,8 @@ struct {
     // refresh interval in seconds
     // -i 2
     int i;
-    uint32_t g_summary;
 } opts = {
     .d = NULL,
-    .g_summary = 0,
     .i = 1,
 };
 
@@ -122,8 +131,13 @@ int init_opts(int argc, char * argv[])
                 if(!optarg[i]) break;
                 switch(optarg[i]) {
                 case 's':
-                    opts.g_summary = 1; 
                     CVIS(SUMMARY_CIX) = 1;
+                    break;
+                case 'z':
+                    CVIS(IP4SADDR_CIX) = 1;
+                    break;
+                case 'x':
+                    CVIS(IP4DADDR_CIX) = 1;
                     break;
                 default:
                     fprintf(stderr, "%s: unkown group option -- %c\n", argv[0], optarg[i]);
@@ -152,6 +166,7 @@ struct td {
     union {
         double   double_val;
         uint64_t uint64_val;
+        in_addr_t in_addr_val;
     };
 };
 
@@ -226,22 +241,34 @@ void upsert(struct table * t, struct pkt_digest * dg, uint32_t len) {
 
     uint64_t c;
     double sz;
-    int wrote;
-    int sumwrote;
+    int wrote, sumwrote;
 
     if(CVIS(SUMMARY_CIX)) {
         sumwrote = sprintf_pkg_summary(summary_buff, dg) + 1;
     }
 
+    u_char ispv4 = 0;
+    for(PROTO_ID j = 0; j < dg->meta.proto_len; j++) {
+        if(dg->meta.protos[j] == ID_IPV4) {
+            ispv4 = 1;
+            break;
+        }
+    }
 
     for(size_t i = 1; i < t->rows; i++) {
 
-        /* dims */
-
         if(CVIS(SUMMARY_CIX) && strcmp(summary_buff, t->data[i][SUMMARY_CIX].cstr))
             continue;
-
-        /* facts */
+        
+        if(CVIS(IP4SADDR_CIX)) {
+            if(ispv4) {
+                if(dg->ipv4.saddr.s_addr != t->data[i][IP4SADDR_CIX].in_addr_val)
+                    continue;
+            } else {
+                if(INADDR_ANY != t->data[i][IP4SADDR_CIX].in_addr_val)
+                    continue;
+            }
+        }
 
         if(CVIS(COUNT_CIX)) {
             t->data[i][COUNT_CIX].uint64_val++;
@@ -267,6 +294,24 @@ void upsert(struct table * t, struct pkt_digest * dg, uint32_t len) {
     if(t->rows >= t->maxrows) {
         pthread_spin_unlock(&globals.sync);
         return;
+    }
+
+    if(CVIS(IP4SADDR_CIX)) {
+        if(ispv4) {
+            t->data[t->rows][IP4SADDR_CIX].in_addr_val = dg->ipv4.saddr.s_addr;
+            wrote = snprintf(
+                t->data[t->rows][IP4SADDR_CIX].cstr, 
+                MCSZ(IP4SADDR_CIX), 
+                "%s", inet_ntoa(dg->ipv4.saddr))  + 1;
+        } else {
+            t->data[t->rows][IP4SADDR_CIX].in_addr_val = INADDR_ANY;
+            wrote = snprintf(
+                t->data[t->rows][IP4SADDR_CIX].cstr,
+                MCSZ(IP4SADDR_CIX),
+                "?")  + 1;
+        }
+        if(wrote > CCSZ(IP4SADDR_CIX))
+            CCSZ(IP4SADDR_CIX) = wrote;
     }
 
     if(CVIS(COUNT_CIX)) {
@@ -328,7 +373,7 @@ int get_device_info() {
     since pcap will run rcv_pkt in single thread it should be ok to
     to store info from currently processed packet in global variable.
 */
-struct pkt_digest pkt_buffer;
+struct pkt_digest pkt_digest;
 
 void rcv_pkt(u_char * const args, const struct pcap_pkthdr * const _h, const u_char * const _p) {
 
@@ -338,22 +383,22 @@ void rcv_pkt(u_char * const args, const struct pcap_pkthdr * const _h, const u_c
 
     switch(globals.dlt) {
     case DLT_EN10MB:
-        pkt_buffer.meta.nexthop = rcv_dlt_en10mb;
+        pkt_digest.meta.nexthop = rcv_dlt_en10mb;
         break;
     case DLT_LINUX_SLL:
-        pkt_buffer.meta.nexthop = rcv_dlt_linux_sll;
+        pkt_digest.meta.nexthop = rcv_dlt_linux_sll;
         break;
     }
 
-    pkt_buffer.meta.proto_len = 0;
+    pkt_digest.meta.proto_len = 0;
 
-    while(pkt_buffer.meta.nexthop) {
-        next = pkt_buffer.meta.nexthop;
-        pkt_buffer.meta.nexthop = NULL;
-        next(&pktptr, &pktlen, &pkt_buffer);
+    while(pkt_digest.meta.nexthop) {
+        next = pkt_digest.meta.nexthop;
+        pkt_digest.meta.nexthop = NULL;
+        next(&pktptr, &pktlen, &pkt_digest);
     }
 
-    upsert(&globals.t, &pkt_buffer, _h->len);
+    upsert(&globals.t, &pkt_digest, _h->len);
 }
 
 const char ct[] = "cleanup... ";
