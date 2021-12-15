@@ -64,7 +64,7 @@ struct colspec {
         .hdr = "COUNT",
         .c_size = 6,
         .max_size = 10,
-        .visible = 1,
+        .visible = 0,
     },
     {
         .hdr = "SIZE",
