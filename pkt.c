@@ -57,6 +57,7 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 #define CT_DOUBLE 1
 #define CT_UINT64 2
 #define CT_INADDR 3
+#define CT_PKTSUM 4
 
 struct colspec {
     char * hdr;
@@ -74,13 +75,13 @@ struct colspec {
         .c_size = 4,
         /* XXXX-YYYY-ZZZZ\0 */
         .max_size = MAX_SUMMARY_LEN,
-        .coltype = CT_CSTR,
+        .coltype = CT_PKTSUM,
         .visible = 0,
         .readonly = 1,
     },
     {         
-        .hdr = "IP4SADDR",
-        .c_size = 10,
+        .hdr = "IPV4SADDR",
+        .c_size = 11,
         /* xxx.xxx.xxx.xxx\0 */
         .max_size = 16,
         .coltype = CT_INADDR,
@@ -88,8 +89,8 @@ struct colspec {
         .readonly = 1,
     },
     {         
-        .hdr = "IP4DADDR",
-        .c_size = 10,
+        .hdr = "IPV4DADDR",
+        .c_size = 11,
         /* xxx.xxx.xxx.xxx\0 */
         .max_size = 16,
         .coltype = CT_INADDR,
@@ -193,6 +194,7 @@ struct td {
     union {
         uint64_t uint64_val;
         struct in_addr in_addr_val;
+        proto_t proto;
     };
 };
 
@@ -221,8 +223,6 @@ struct globals {
     },
     .rthr = 0,
 };
-
-char summary_buff[MAX_SUMMARY_LEN];
 
 int
 snprintf_size(char *buf, int blen, double size) {
@@ -260,63 +260,54 @@ double atof_size(char * sizestr) {
     return sz;
 }
 
-void upsert(struct table * t, struct pkt_digest * dg, uint32_t len) {
+
+struct in_addr upsert_inaddr;
+
+#define in_addr_cmp(a,b) ((a).s_addr != (b).s_addr)
+
+void upsert(struct table * t, struct pkt_digest * dg) {
 
     if(pthread_spin_lock(&globals.sync)) 
         print_errno_exit(upsert:)
 
-    int sumwrote;
-
-    if(CVIS(SUMMARY_CIX)) {
-        sumwrote = sprintf_pkg_summary(summary_buff, dg) + 1;
+    if(CVIS(IP4SADDR_CIX)) {
+        if(dg->meta.proto_flags&ID_IPV4)
+            upsert_inaddr = dg->ipv4.saddr;
+        else
+            upsert_inaddr.s_addr = INADDR_TEST_NET_1;
     }
 
-    u_char ispv4 = 0;
-    for(PROTO_ID j = 0; j < dg->meta.proto_len; j++) {
-        if(dg->meta.protos[j] == ID_IPV4) {
-            ispv4 = 1;
-            break;
-        }
-    }
+    struct td * row;
 
     for(size_t i = 1; i < t->rows; i++) {
 
-        if(CVIS(SUMMARY_CIX) && strcmp(summary_buff, t->data[i][SUMMARY_CIX].cstr))
+        row = t->data[i];
+
+        if(CVIS(SUMMARY_CIX) && dg->meta.proto_flags != row[SUMMARY_CIX].proto)
             continue;
         
-        if(CVIS(IP4SADDR_CIX)) {
-            if(ispv4) {
-                if(dg->ipv4.saddr.s_addr != t->data[i][IP4SADDR_CIX].in_addr_val.s_addr)
-                    continue;
-            } else {
-                if(INADDR_TEST_NET_1 != t->data[i][IP4SADDR_CIX].in_addr_val.s_addr)
-                    continue;
-            }
-        }
+        if(CVIS(IP4SADDR_CIX) && in_addr_cmp(row[IP4SADDR_CIX].in_addr_val, upsert_inaddr))
+            continue;
+
+        /* row is the same => update facts */
 
         if(CVIS(COUNT_CIX)) {
-            t->data[i][COUNT_CIX].uint64_val++;
+            row[COUNT_CIX].uint64_val++;
         }
 
         if(CVIS(SIZE_CIX)) {
-            t->data[i][SIZE_CIX].uint64_val += len;
+            row[SIZE_CIX].uint64_val += dg->meta.total_len;
         }
 
-        pthread_spin_unlock(&globals.sync);
-        return;
+        goto UNLOCK_END;
     }
 
     if(t->rows >= t->maxrows) {
-        pthread_spin_unlock(&globals.sync);
-        return;
+        goto UNLOCK_END;
     }
 
     if(CVIS(IP4SADDR_CIX)) {
-        if(ispv4) {
-            t->data[t->rows][IP4SADDR_CIX].in_addr_val = dg->ipv4.saddr;
-        } else {
-            t->data[t->rows][IP4SADDR_CIX].in_addr_val.s_addr = INADDR_TEST_NET_1;
-        }
+        t->data[t->rows][IP4SADDR_CIX].in_addr_val = upsert_inaddr;
     }
 
     if(CVIS(COUNT_CIX)) {
@@ -324,17 +315,16 @@ void upsert(struct table * t, struct pkt_digest * dg, uint32_t len) {
     }
 
     if(CVIS(SIZE_CIX)) {
-        t->data[t->rows][SIZE_CIX].uint64_val = len;
+        t->data[t->rows][SIZE_CIX].uint64_val = dg->meta.total_len;
     }
 
     if(CVIS(SUMMARY_CIX)) {
-        strncpy(t->data[t->rows][SUMMARY_CIX].cstr, summary_buff, MCSZ(SUMMARY_CIX));
-        if(sumwrote > CCSZ(SUMMARY_CIX))
-            CCSZ(SUMMARY_CIX) = sumwrote;
+        t->data[t->rows][SUMMARY_CIX].proto = dg->meta.proto_flags;
     }
     
     t->rows++;
 
+UNLOCK_END:
     pthread_spin_unlock(&globals.sync);
 }
 
@@ -390,7 +380,8 @@ void rcv_pkt(u_char * const args, const struct pcap_pkthdr * const _h, const u_c
         break;
     }
 
-    pkt_digest.meta.proto_len = 0;
+    pkt_digest.meta.proto_flags = 0;
+    pkt_digest.meta.total_len = _h->len;
 
     while(pkt_digest.meta.nexthop) {
         next = pkt_digest.meta.nexthop;
@@ -398,7 +389,7 @@ void rcv_pkt(u_char * const args, const struct pcap_pkthdr * const _h, const u_c
         next(&pktptr, &pktlen, &pkt_digest);
     }
 
-    upsert(&globals.t, &pkt_digest, _h->len);
+    upsert(&globals.t, &pkt_digest);
 }
 
 const char ct[] = "cleanup... ";
@@ -442,6 +433,9 @@ void printbl(struct table * t) {
             if(!t->data[i][j].cstr[0] || (!CRDONLY(j) && i > 0)) {
 
                 switch(CTP(j)) {
+                case CT_PKTSUM:
+                    wrote = sprintf_proto(t->data[i][j].cstr, t->data[i][j].proto);
+                    break;
                 case CT_DOUBLE:
                     wrote = snprintf_size(
                         t->data[i][j].cstr, 

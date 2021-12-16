@@ -11,13 +11,16 @@
 
 #define RETURN_RCV { *next = NULL; return; }
 
-static inline void set_pkt_meta(struct pkt_meta * meta, PROTO_ID id) {
-    if(meta->proto_len >= MAX_PROTO_LEN)  {
-        //fputs("proto overflow\n", stderr);
-        return;
+#define set_pkt_meta(meta, id) set_pkt_meta_f(meta, 1<<id)
+
+static inline void set_pkt_meta_f(struct pkt_meta * meta, proto_t flag) {
+    if(meta->proto_flags & flag){
+        fprintf(stderr, "found duplicate protocol (%u | %u), aborting\n", meta->proto_flags, flag);
+        exit(1);
     }
-    meta->protos[meta->proto_len++] = id;
+    meta->proto_flags |= flag;
 }
+
 
 void rcv_udp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
     if(*plen < sizeof(struct udphdr)) {
@@ -28,8 +31,9 @@ void rcv_udp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
 
     i->udp.source = ntohs(h->source);
     i->udp.dest = ntohs(h->dest);
-    set_pkt_meta(&i->meta, ID_UDP);
 
+    set_pkt_meta(&i->meta, ID_UDP);
+    set_pkt_meta(&i->meta, ID_PROTO_TERM);
     return;
 }
 
@@ -43,11 +47,13 @@ void rcv_tcp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
     i->tcp.source = ntohs(h->source);
     i->tcp.dest = ntohs(h->dest);
     set_pkt_meta(&i->meta, ID_TCP);
+    set_pkt_meta(&i->meta, ID_PROTO_TERM);
 }
 
 
 void rcv_icmp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
     set_pkt_meta(&i->meta, ID_ICMP);
+    set_pkt_meta(&i->meta, ID_PROTO_TERM);
 }
 
 pktcallback switch_ipproto(unsigned char proto) {
@@ -154,45 +160,31 @@ void sprintf_hwaddr(char * buff, u_char * hwaddr) {
 }
 
 const char * PROTO_ID_STR[] = {
-    "SLL",
-    "ETH",
-    "IP4",
-    "TCP",
-    "UDP",
-    "ICMP"
+    "SLL",  /* ID_LINUX_SLL */
+    "ETH",  /* ID_EN10MB */
+    "IP4",  /* ID_IPV4 */
+    "TCP",  /* ID_TCP */
+    "UDP",  /* ID_UDP */
+    "ICMP", /* ID_ICMP */
+    "?"     /* ID_PROTO_TERM */
 };
 
 
 // s length must be >= (MAX_SUMMARY_LEN)
-int sprintf_pkg_summary(char * s, struct pkt_digest * pi) {
-    if(!pi->meta.proto_len) {
-        s[0] = 0;
-        return 0;
-    }
-    int wrote = 0, total_wrote = 0;
-    for(PROTO_ID i = 0; i < pi->meta.proto_len; i++) {
-        const char * proto = PROTO_ID_STR[pi->meta.protos[i]];
-        if(i < pi->meta.proto_len - 1)
-            wrote = sprintf(s, "%s-", proto);
-        else 
-            wrote = sprintf(s, "%s", proto);
-        s += wrote;
-        total_wrote += wrote;
-    }
-    return total_wrote;
-}
+int sprintf_proto(char * s, proto_t t) {
 
-    // char sh[3*ETH_ALEN], dh[3 * ETH_ALEN];
-    // sprintf_hwaddr(sh, pi->hsrc);
-    // sprintf_hwaddr(dh, pi->hdest);
-    // printf("h_proto=%04x dlt=%d %s -> %s\n", pi->ethtype, globals.dlt, sh, dh);
-    // if(pi->aethtype == ETH_P_IP) {
-    //     char saddrs[16], daddrs[16];
-    //     char * sp = inet_ntoa(pi->ipv4.saddr);
-    //     memcpy(saddrs, sp, 15);
-    //     sp = inet_ntoa(pi->ipv4.daddr);
-    //     memcpy(daddrs, sp, 15);
-    //     saddrs[15] = 0;
-    //     daddrs[15] = 0;
-    //     printf("%s -> %s\n", saddrs, daddrs);
-    // }
+    int wrote = 0;
+
+    for(int i = 0; i < ID_PROTO_TERM; i++)
+        if((t >> i) & (u_char)1)
+            wrote += snprintf(s+wrote, MAX_SUMMARY_LEN-wrote, "%s-", PROTO_ID_STR[i]);
+
+    if(!(t&(1<<ID_PROTO_TERM))) {
+        wrote += snprintf(s+wrote, MAX_SUMMARY_LEN-wrote, PROTO_ID_STR[ID_PROTO_TERM]);
+    } else {
+        /* remove trailing hyphen */
+        s[wrote - 1] = 0;
+    }
+
+    return wrote;
+}
