@@ -267,9 +267,6 @@ struct in_addr upsert_inaddr;
 
 void upsert(struct table * t, struct pkt_digest * dg) {
 
-    if(pthread_spin_lock(&globals.sync)) 
-        print_errno_exit(upsert:)
-
     if(CVIS(IP4SADDR_CIX)) {
         if(dg->meta.proto_flags&ID_IPV4)
             upsert_inaddr = dg->ipv4.saddr;
@@ -290,6 +287,9 @@ void upsert(struct table * t, struct pkt_digest * dg) {
             continue;
 
         /* row is the same => update facts */
+        if(pthread_spin_lock(&globals.sync)) 
+            print_errno_exit(upsert:)
+
 
         if(CVIS(COUNT_CIX)) {
             row[COUNT_CIX].uint64_val++;
@@ -301,6 +301,9 @@ void upsert(struct table * t, struct pkt_digest * dg) {
 
         goto UNLOCK_END;
     }
+    
+    if(pthread_spin_lock(&globals.sync)) 
+        print_errno_exit(upsert:)
 
     if(t->rows >= t->maxrows) {
         goto UNLOCK_END;
