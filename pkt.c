@@ -53,11 +53,10 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 #define COUNT_CIX 3
 #define SIZE_CIX  4
 
-#define CT_CSTR   0
-#define CT_DOUBLE 1
-#define CT_UINT64 2
-#define CT_INADDR 3
-#define CT_PKTSUM 4
+#define CT_DOUBLE 0
+#define CT_UINT64 1
+#define CT_INADDR 2
+#define CT_PKTSUM 3
 
 struct colspec {
     char * hdr;
@@ -139,9 +138,12 @@ struct {
     // refresh interval in seconds
     // -i 2
     int i;
+    /* raw output only */
+    int r;
 } opts = {
     .d = NULL,
     .i = 1,
+    .r = 0,
 };
 
 int init_opts(int argc, char * argv[])
@@ -189,8 +191,20 @@ int init_opts(int argc, char * argv[])
     return 0;
 }
 
+
+const char * clr_norm = "\x1B[0m";
+const char * clr_red =  "\x1B[31m";
+const char * clr_grn =  "\x1B[32m";
+const char * clr_yel =  "\x1B[33m";
+const char * clr_blu = "\x1B[34m";
+const char * clr_mag = "\x1B[35m";
+const char * clr_cyn = "\x1B[36m";
+const char * clr_wht = "\x1B[37m";
+
 struct td {
     char * cstr;
+    const char * adrstart;
+    const char * adrend;
     union {
         uint64_t uint64_val;
         struct in_addr in_addr_val;
@@ -268,7 +282,7 @@ struct in_addr upsert_inaddr;
 void upsert(struct table * t, struct pkt_digest * dg) {
 
     if(CVIS(IP4SADDR_CIX)) {
-        if(dg->meta.proto_flags&ID_IPV4)
+        if(dg->meta.proto_flags&IDF(ID_IPV4))
             upsert_inaddr = dg->ipv4.saddr;
         else
             upsert_inaddr.s_addr = INADDR_TEST_NET_1;
@@ -290,7 +304,6 @@ void upsert(struct table * t, struct pkt_digest * dg) {
         if(pthread_spin_lock(&globals.sync)) 
             print_errno_exit(upsert:)
 
-
         if(CVIS(COUNT_CIX)) {
             row[COUNT_CIX].uint64_val++;
         }
@@ -301,15 +314,19 @@ void upsert(struct table * t, struct pkt_digest * dg) {
 
         goto UNLOCK_END;
     }
-    
+
+    if(t->rows >= t->maxrows) {
+        return;
+    }
+
     if(pthread_spin_lock(&globals.sync)) 
         print_errno_exit(upsert:)
 
-    if(t->rows >= t->maxrows) {
-        goto UNLOCK_END;
-    }
-
     if(CVIS(IP4SADDR_CIX)) {
+        if(globals.wladdr && !in_addr_cmp(upsert_inaddr, globals.laddr)) {
+            t->data[t->rows][IP4SADDR_CIX].adrstart = clr_blu;
+             t->data[t->rows][IP4SADDR_CIX].adrend = clr_norm;
+        }
         t->data[t->rows][IP4SADDR_CIX].in_addr_val = upsert_inaddr;
     }
 
@@ -430,7 +447,7 @@ void printbl(struct table * t) {
     for(size_t i = 0; i < t->rows; i++) {
         for(size_t j = 0; j < t->cols; j++) {
 
-            if(!t->data[i][j].cstr) 
+            if(!CVIS(j)) 
                 continue;
 
             if(!t->data[i][j].cstr[0] || (!CRDONLY(j) && i > 0)) {
@@ -473,12 +490,27 @@ void printbl(struct table * t) {
                 if(wrote > CCSZ(j))
                     CCSZ(j) = wrote;
             }
+        }
+    }
 
+    for(size_t i = 0; i < t->rows; i++) {
+        for(size_t j = 0; j < t->cols; j++) {
+            if(!CVIS(j)) 
+                continue;
             csz = CCSZ(j);
-            printf("%*.*s", csz, csz, t->data[i][j].cstr);
+            if(t->data[i][j].adrstart) {
+                printf("%s%*.*s%s", 
+                    t->data[i][j].adrstart, 
+                    csz, csz, 
+                    t->data[i][j].cstr, 
+                    t->data[i][j].adrend);
+            } else {
+                printf("%*.*s", csz, csz, t->data[i][j].cstr);
+            }
         }
         puts("");
     }
+
 }
 
 void initbl(struct table * t) {

@@ -15,6 +15,8 @@ typedef u_char proto_t;
 #define ID_ICMP       5
 #define ID_PROTO_TERM 6
 
+#define IDF(ID) (1<<(ID))
+
 #define MAX_PROTO_LEN 8
 
 struct pkt_digest;
