@@ -106,6 +106,43 @@ void rcv_ipv4(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
     i->meta.nexthop = switch_ipproto(h->protocol);
 }
 
+#define PPP_DLL_IPV4 0x0021
+#define PPP_DLL_IPV6 0x0057
+
+static inline pktcallback switch_on_ppp_dll_proto(uint16_t tt) {
+    switch(tt) {
+    case PPP_DLL_IPV4:
+        return rcv_ipv4;
+    case PPP_DLL_IPV6:
+    default:
+        return NULL;
+    }
+}
+
+void rcv_ppp_ses(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
+    set_pkt_meta(&i->meta, ID_PPPSES);
+
+    if(*plen < sizeof(struct pppoe_hdr)) {
+        set_pkt_meta(&i->meta, ID_PROTO_ETERM);
+        return;
+    }
+
+    struct pppoe_hdr * hdr = (struct pppoe_hdr *)*p;
+
+    /* ppp session should have code set to 0 = session data */
+    if(hdr->code != 0 || !hdr->tag) {
+        set_pkt_meta(&i->meta, ID_PROTO_UNKOWN);
+        return;
+    }
+
+    uint16_t t = ntohs(hdr->tag->tag_type);
+
+    *p += PPPOE_SES_HLEN;
+    *plen -= PPPOE_SES_HLEN;
+
+    i->meta.nexthop = switch_on_ppp_dll_proto(t);
+}
+
 /*
     return next handler for packet inside link frame
 */
@@ -113,10 +150,11 @@ pktcallback switch_ethertype(u_int16_t ethtype) {
     switch(ethtype) {
     case ETH_P_IP:
         return rcv_ipv4;
+    case ETH_P_PPP_SES:
+        return rcv_ppp_ses;
     case ETH_P_IPV6:
     case ETH_P_ARP:
     case ETH_P_PPP_DISC:
-    case ETH_P_PPP_SES:
     default:
         return NULL;
     }
@@ -191,6 +229,7 @@ void sprintf_hwaddr(char * buff, u_char * hwaddr) {
 const char * PROTO_ID_STR[] = {
     "SLL",  /* ID_LINUX_SLL */
     "ETH",  /* ID_EN10MB */
+    "PPPS", /* ID_PPPSES */
     "IP4",  /* ID_IPV4 */
     "TCP",  /* ID_TCP */
     "UDP",  /* ID_UDP */
