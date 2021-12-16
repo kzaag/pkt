@@ -361,8 +361,6 @@ double atof_size(char * sizestr) {
 }
 
 
-struct in_addr upsert_inaddr1, upsert_inaddr2;
-
 #define in_addr_cmp(a,b) ((a).s_addr != (b).s_addr)
 
 static inline void swaprow(struct td ** tdata, u_int16_t i, u_int16_t j) {
@@ -409,20 +407,43 @@ void sort(struct table * t) {
 }
 
 void upsert(struct table * t, struct pkt_digest * dg) {
+    struct in_addr inaddr1, inaddr2;
+    uint16_t uint16_1, uint16_2;
+
 
     if(CVIS(IP4SADDR_CIX)) {
         if(dg->meta.proto_flags&IDF(ID_IPV4)) {
-            upsert_inaddr1 = dg->ipv4.saddr;
+            inaddr1 = dg->ipv4.saddr;
         } else {
-            upsert_inaddr1.s_addr = INADDR_TEST_NET_1;
+            inaddr1.s_addr = INADDR_TEST_NET_1;
         }
     }
 
     if(CVIS(IP4DADDR_CIX)) {
         if(dg->meta.proto_flags&IDF(ID_IPV4)) {
-            upsert_inaddr2 = dg->ipv4.daddr;
+            inaddr2 = dg->ipv4.daddr;
         } else {
-            upsert_inaddr2.s_addr = INADDR_TEST_NET_1;
+            inaddr2.s_addr = INADDR_TEST_NET_1;
+        }
+    }
+
+    if(CVIS(SRC_CIX)) {
+        if(dg->meta.proto_flags&IDF(ID_UDP)) {
+            uint16_1 = dg->udp.source;
+        } else if(dg->meta.proto_flags&IDF(ID_TCP)) {
+            uint16_1 = dg->tcp.source;
+        } else {
+            uint16_1 = 0;
+        }
+    }
+
+    if(CVIS(DST_CIX)) {
+        if(dg->meta.proto_flags&IDF(ID_UDP)) {
+            uint16_2 = dg->udp.dest;
+        } else if(dg->meta.proto_flags&IDF(ID_TCP)) {
+            uint16_2 = dg->tcp.dest;
+        } else {
+            uint16_2 = 0;
         }
     }
 
@@ -436,31 +457,17 @@ void upsert(struct table * t, struct pkt_digest * dg) {
         if(CVIS(SUMMARY_CIX) && dg->meta.proto_flags != row[SUMMARY_CIX].proto)
             continue;
         
-        if(CVIS(IP4SADDR_CIX) && in_addr_cmp(row[IP4SADDR_CIX].in_addr_val, upsert_inaddr1))
+        if(CVIS(IP4SADDR_CIX) && in_addr_cmp(row[IP4SADDR_CIX].in_addr_val, inaddr1))
             continue;
 
-        if(CVIS(IP4DADDR_CIX) && in_addr_cmp(row[IP4DADDR_CIX].in_addr_val, upsert_inaddr2))
+        if(CVIS(IP4DADDR_CIX) && in_addr_cmp(row[IP4DADDR_CIX].in_addr_val, inaddr2))
             continue;
 
-        if(CVIS(SRC_CIX)) {
-            if(dg->meta.proto_flags&ID_UDP) {
-                if(row[SRC_CIX].uint16v != dg->udp.source) continue;
-            } else if(dg->meta.proto_flags&ID_TCP) {
-                if(row[SRC_CIX].uint16v != dg->tcp.source) continue;
-            } else {
-                if(row[SRC_CIX].uint16v) continue;
-            }
-        }
+        if(CVIS(SRC_CIX) && uint16_1 != row[SRC_CIX].uint16v)
+            continue;
 
-        if(CVIS(DST_CIX)) {
-            if(dg->meta.proto_flags&ID_UDP) {
-                if(row[DST_CIX].uint16v != dg->udp.dest) continue;
-            } else if(dg->meta.proto_flags&ID_TCP) {
-                if(row[DST_CIX].uint16v != dg->tcp.dest) continue;
-            } else {
-                if(row[DST_CIX].uint16v) continue;
-            }
-        }
+        if(CVIS(DST_CIX) && uint16_2 != row[DST_CIX].uint16v)
+            continue;
 
         /* row is the same => update facts */
         if(pthread_spin_lock(&globals.sync)) 
@@ -494,44 +501,32 @@ void upsert(struct table * t, struct pkt_digest * dg) {
     }
 
     if(CVIS(IP4SADDR_CIX)) {
-        if(!opts.r && globals.wladdr && !in_addr_cmp(upsert_inaddr1, globals.laddr)) {
+        if(!opts.r && globals.wladdr && !in_addr_cmp(inaddr1, globals.laddr)) {
             row[IP4SADDR_CIX].adrstart = clr_blu;
             row[IP4SADDR_CIX].adrend = clr_norm;
         } else {
             row[IP4SADDR_CIX].adrstart = NULL;
             row[IP4SADDR_CIX].adrend = NULL;
         }
-        row[IP4SADDR_CIX].in_addr_val = upsert_inaddr1;
+        row[IP4SADDR_CIX].in_addr_val = inaddr1;
     }
 
     if(CVIS(IP4DADDR_CIX)) {
-        if(!opts.r && globals.wladdr && !in_addr_cmp(upsert_inaddr2, globals.laddr)) {
+        if(!opts.r && globals.wladdr && !in_addr_cmp(inaddr2, globals.laddr)) {
             row[IP4DADDR_CIX].adrstart = clr_blu;
             row[IP4DADDR_CIX].adrend = clr_norm;
         } else {
             row[IP4DADDR_CIX].adrstart = NULL;
             row[IP4DADDR_CIX].adrend = NULL;
         }
-        row[IP4DADDR_CIX].in_addr_val = upsert_inaddr2;
+        row[IP4DADDR_CIX].in_addr_val = inaddr2;
     }
 
     if(CVIS(SRC_CIX)) {
-        if(dg->meta.proto_flags&ID_UDP) {
-            row[SRC_CIX].uint16v = dg->udp.source;
-        } else if(dg->meta.proto_flags&ID_TCP) {
-            row[SRC_CIX].uint16v = dg->tcp.source;
-        } else {
-            row[SRC_CIX].uint16v = 0;
-        }
+        row[SRC_CIX].uint16v = uint16_1;
     }
     if(CVIS(DST_CIX)) {
-        if(dg->meta.proto_flags&ID_UDP) {
-            row[DST_CIX].uint16v = dg->udp.dest;
-        } else if(dg->meta.proto_flags&ID_TCP) {
-            row[DST_CIX].uint16v = dg->tcp.dest;
-        } else {
-            row[DST_CIX].uint16v = 0;
-        }
+        row[DST_CIX].uint16v = uint16_2;
     }
 
     if(CVIS(COUNT_CIX)) {
