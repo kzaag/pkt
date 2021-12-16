@@ -23,7 +23,10 @@ static inline void set_pkt_meta_f(struct pkt_meta * meta, proto_t flag) {
 
 
 void rcv_udp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
+    set_pkt_meta(&i->meta, ID_UDP);
+
     if(*plen < sizeof(struct udphdr)) {
+        set_pkt_meta(&i->meta, ID_PROTO_ETERM);
         return;
     }
 
@@ -32,13 +35,15 @@ void rcv_udp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
     i->udp.source = ntohs(h->source);
     i->udp.dest = ntohs(h->dest);
 
-    set_pkt_meta(&i->meta, ID_UDP);
     set_pkt_meta(&i->meta, ID_PROTO_TERM);
     return;
 }
 
 void rcv_tcp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
+    set_pkt_meta(&i->meta, ID_TCP);
+
     if(*plen < sizeof(struct tcphdr)) {
+        set_pkt_meta(&i->meta, ID_PROTO_ETERM);
         return;
     }
 
@@ -46,7 +51,6 @@ void rcv_tcp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
 
     i->tcp.source = ntohs(h->source);
     i->tcp.dest = ntohs(h->dest);
-    set_pkt_meta(&i->meta, ID_TCP);
     set_pkt_meta(&i->meta, ID_PROTO_TERM);
 }
 
@@ -70,8 +74,12 @@ pktcallback switch_ipproto(unsigned char proto) {
 }
 
 void rcv_ipv4(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
-    if(*plen < sizeof(struct iphdr))
+    set_pkt_meta(&i->meta, ID_IPV4);
+
+    if(*plen < sizeof(struct iphdr)) {
+        set_pkt_meta(&i->meta, ID_PROTO_ETERM);
         return;
+    }
 
     struct iphdr * h = (struct iphdr *)*p;
 
@@ -80,7 +88,6 @@ void rcv_ipv4(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
 
     i->ipv4.saddr.s_addr = h->saddr;
     i->ipv4.daddr.s_addr = h->daddr;
-    set_pkt_meta(&i->meta, ID_IPV4);
     
     u_char size = h->ihl * 5;
     *p += size;
@@ -108,16 +115,20 @@ pktcallback switch_ethertype(u_int16_t ethtype) {
     handle ethernet (802.3) headers 
 */
 void rcv_dlt_en10mb(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
-    if(*plen < sizeof(struct ethhdr))
+    set_pkt_meta(&i->meta, ID_EN10MB);
+
+    if(*plen < sizeof(struct ethhdr)) {
+        set_pkt_meta(&i->meta, ID_PROTO_ETERM);
         return;
+    }
 
     struct ethhdr * h = (struct ethhdr*)(*p);
     i->en10mb.ethertype = ntohs(h->h_proto);
     memcpy(i->en10mb.hwdest, h->h_dest, ETH_ALEN);
     memcpy(i->en10mb.hwsrc, h->h_source, ETH_ALEN);
-    set_pkt_meta(&i->meta, ID_EN10MB);
     *p += sizeof(struct ethhdr);
     *plen -= sizeof(struct ethhdr);
+
     i->meta.nexthop = switch_ethertype(i->en10mb.ethertype);
 }
 
@@ -133,18 +144,23 @@ struct linux_sllhdr {
     handle packets which have been scrambled by linux modules (for example by pppoe)   
 */
 void rcv_dlt_linux_sll(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
-    if(*plen < sizeof(struct linux_sllhdr)) 
+    
+    set_pkt_meta(&i->meta, ID_LINUX_SLL);
+
+    if(*plen < sizeof(struct linux_sllhdr)) {
+        set_pkt_meta(&i->meta, ID_PROTO_ETERM);
         return;
+    }
 
     struct linux_sllhdr * hdr = (struct linux_sllhdr *)*p;
     
     i->sll.ethertype = ntohs(hdr->proto);
-    
-    set_pkt_meta(&i->meta, ID_LINUX_SLL);
 
     // this could be encapsulated novell 802.3, 802.2 llc, or CAN - in that case abort
-    if(i->sll.ethertype <= 1500)
+    if(i->sll.ethertype <= 1500) {
+        set_pkt_meta(&i->meta, ID_PROTO_UNKOWN);
         return;
+    }
 
     *p += sizeof(struct linux_sllhdr);
     *plen -= sizeof(struct linux_sllhdr);
@@ -166,7 +182,11 @@ const char * PROTO_ID_STR[] = {
     "TCP",  /* ID_TCP */
     "UDP",  /* ID_UDP */
     "ICMP", /* ID_ICMP */
-    "?"     /* ID_PROTO_TERM */
+
+    "x",     /* ID_PROTO_ETERM */
+    "*",      /* ID_PROTO_TERM */
+
+    "?"    /* ID_PROTO_UNKOWN */
 };
 
 
@@ -175,15 +195,19 @@ int sprintf_proto(char * s, proto_t t) {
 
     int wrote = 0;
 
-    for(int i = 0; i < ID_PROTO_TERM; i++)
+    for(int i = 0; i < ID_PROTO_START; i++)
         if((t >> i) & (u_char)1)
             wrote += snprintf(s+wrote, MAX_SUMMARY_LEN-wrote, "%s-", PROTO_ID_STR[i]);
 
-    if(!(t&(1<<ID_PROTO_TERM))) {
-        wrote += snprintf(s+wrote, MAX_SUMMARY_LEN-wrote, PROTO_ID_STR[ID_PROTO_TERM]);
+    if(t & IDF(ID_PROTO_TERM)) {
+        /* wrote += snprintf(s+wrote, MAX_SUMMARY_LEN-wrote, PROTO_ID_STR[ID_PROTO_TERM]); */
+        wrote--;
+        s[wrote] = 0;
+    } else if(t & IDF(ID_PROTO_ETERM)) {
+        wrote--;
+        wrote += snprintf(s+wrote, MAX_SUMMARY_LEN-wrote, PROTO_ID_STR[ID_PROTO_ETERM]);
     } else {
-        /* remove trailing hyphen */
-        s[wrote - 1] = 0;
+        wrote += snprintf(s+wrote, MAX_SUMMARY_LEN-wrote, PROTO_ID_STR[ID_PROTO_UNKOWN]);
     }
 
     return wrote;

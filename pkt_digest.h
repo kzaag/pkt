@@ -6,18 +6,26 @@
 #include <linux/if_ether.h>
 #include <netinet/in.h>
 
-typedef u_char proto_t;
+typedef uint16_t proto_t;
 #define ID_LINUX_SLL  0
 #define ID_EN10MB     1
 #define ID_IPV4       2
 #define ID_TCP        3
 #define ID_UDP        4
 #define ID_ICMP       5
-#define ID_PROTO_TERM 6
+
+#define ID_PROTO_START 6
+
+/* packet terminated unexpectedly */
+#define ID_PROTO_ETERM (ID_PROTO_START)
+/* packet was correct */
+#define ID_PROTO_TERM  (ID_PROTO_START+1)
+/* uknown / unsupported proto */
+#define ID_PROTO_UNKOWN (ID_PROTO_START+2)
 
 #define IDF(ID) (1<<(ID))
 
-#define MAX_PROTO_LEN 8
+#define MAX_PROTO_LEN 10
 
 struct pkt_digest;
 
