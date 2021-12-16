@@ -6,6 +6,8 @@
 #include <linux/if_ether.h>
 #include <netinet/in.h>
 
+#define INADDR_TEST_NET_1 ((in_addr_t)0xc0000200) /* 192.0.2.0 */
+
 typedef uint16_t proto_t;
 #define ID_LINUX_SLL  0
 #define ID_EN10MB     1
@@ -80,15 +82,17 @@ struct pkt_digest
         } ipv6;
     };
 
-    struct {
-        uint16_t source;
-        uint16_t dest;
-    } tcp;
+    union {
+        struct {
+            uint16_t source;
+            uint16_t dest;
+        } tcp;
 
-    struct {
-        uint16_t source;
-        uint16_t dest;
-    } udp;
+        struct {
+            uint16_t source;
+            uint16_t dest;
+        } udp;
+    };
 
     // struct
     // {

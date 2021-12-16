@@ -12,8 +12,6 @@
 
 /* unlikely ip addresses which we may use for testing */
 
-#define INADDR_TEST_NET_1 ((in_addr_t)0xc0000200) /* 192.0.2.0 */
-
 static char pcaperr[PCAP_ERRBUF_SIZE];
 
 #define print_errno(hdr) fprintf(stderr, #hdr " %s\n", errno ? strerror(errno) : "unkown error");
@@ -47,18 +45,25 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 
 /* indexes for specified columns within colspec */
 #define SUMMARY_CIX   0
+/* IPv4 address pair */
 #define IP4SADDR_CIX  1
 #define IP4DADDR_CIX  2
+/* UDP/TCP port pair */
+#define SRC_CIX       3
+#define DST_CIX       4
 
-#define COUNT_CIX 3
-#define SIZE_CIX  4
-#define TIME_CIX  5
+#define CIX_FACT_START 5
+
+#define COUNT_CIX CIX_FACT_START
+#define SIZE_CIX  (CIX_FACT_START+1)
+#define TIME_CIX  (CIX_FACT_START+2)
 
 #define CT_DOUBLE 0
 #define CT_UINT64 1
 #define CT_INADDR 2
 #define CT_PKTSUM 3
 #define CT_TIME   4
+#define CT_UINT16 5
 
 struct colspec {
     char * hdr;
@@ -95,6 +100,24 @@ struct colspec {
         /* xxx.xxx.xxx.xxx\0 */
         .max_size = 16,
         .coltype = CT_INADDR,
+        .visible = 0,
+        .readonly = 1,
+    },
+    {         
+        .hdr = "SRC",
+        .c_size = 6,
+        /* xxxxx\0 */
+        .max_size = 6,
+        .coltype = CT_UINT16,
+        .visible = 0,
+        .readonly = 1,
+    },
+    {         
+        .hdr = "DST",
+        .c_size = 6,
+        /* xxxxx\0 */
+        .max_size = 6,
+        .coltype = CT_UINT16,
         .visible = 0,
         .readonly = 1,
     },
@@ -179,6 +202,12 @@ int init_opts(int argc, char * argv[])
                 case 'x':
                     CVIS(IP4DADDR_CIX) = 1;
                     break;
+                case 'c':
+                    CVIS(SRC_CIX) = 1;
+                    break;
+                case 'v':
+                    CVIS(DST_CIX) = 1;
+                    break;
                 default:
                     fprintf(stderr, "%s: unkown group option -- %c\n", argv[0], optarg[i]);
                     break;
@@ -217,6 +246,7 @@ struct td {
     const char * adrend;
     union {
         uint64_t uint64_val;
+        uint16_t uint16v;
         struct in_addr in_addr_val;
         proto_t proto;
         time_t time;
@@ -412,6 +442,26 @@ void upsert(struct table * t, struct pkt_digest * dg) {
         if(CVIS(IP4DADDR_CIX) && in_addr_cmp(row[IP4DADDR_CIX].in_addr_val, upsert_inaddr2))
             continue;
 
+        if(CVIS(SRC_CIX)) {
+            if(dg->meta.proto_flags&ID_UDP) {
+                if(row[SRC_CIX].uint16v != dg->udp.source) continue;
+            } else if(dg->meta.proto_flags&ID_TCP) {
+                if(row[SRC_CIX].uint16v != dg->tcp.source) continue;
+            } else {
+                if(row[SRC_CIX].uint16v) continue;
+            }
+        }
+
+        if(CVIS(DST_CIX)) {
+            if(dg->meta.proto_flags&ID_UDP) {
+                if(row[DST_CIX].uint16v != dg->udp.dest) continue;
+            } else if(dg->meta.proto_flags&ID_TCP) {
+                if(row[DST_CIX].uint16v != dg->tcp.dest) continue;
+            } else {
+                if(row[DST_CIX].uint16v) continue;
+            }
+        }
+
         /* row is the same => update facts */
         if(pthread_spin_lock(&globals.sync)) 
             print_errno_exit(upsert:)
@@ -463,6 +513,25 @@ void upsert(struct table * t, struct pkt_digest * dg) {
             row[IP4DADDR_CIX].adrend = NULL;
         }
         row[IP4DADDR_CIX].in_addr_val = upsert_inaddr2;
+    }
+
+    if(CVIS(SRC_CIX)) {
+        if(dg->meta.proto_flags&ID_UDP) {
+            row[SRC_CIX].uint16v = dg->udp.source;
+        } else if(dg->meta.proto_flags&ID_TCP) {
+            row[SRC_CIX].uint16v = dg->tcp.source;
+        } else {
+            row[SRC_CIX].uint16v = 0;
+        }
+    }
+    if(CVIS(DST_CIX)) {
+        if(dg->meta.proto_flags&ID_UDP) {
+            row[DST_CIX].uint16v = dg->udp.dest;
+        } else if(dg->meta.proto_flags&ID_TCP) {
+            row[DST_CIX].uint16v = dg->tcp.dest;
+        } else {
+            row[DST_CIX].uint16v = 0;
+        }
     }
 
     if(CVIS(COUNT_CIX)) {
@@ -621,6 +690,16 @@ void printbl(struct table * t) {
                         MCSZ(j), 
                         "%lu", t->data[i][j].uint64_val);
 
+                    break;
+                case CT_UINT16:
+                    if(t->data[i][j].uint16v) {
+                        wrote = snprintf(
+                            t->data[i][j].cstr, 
+                            MCSZ(j), 
+                            "%u", t->data[i][j].uint16v);
+                    } else {
+                        wrote = sprintf(t->data[i][j].cstr, "?");
+                    }
                     break;
                 case CT_TIME:
                     if(now < 1 || t->data[i][j].time < 1)

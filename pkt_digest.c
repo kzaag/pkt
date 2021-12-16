@@ -27,6 +27,8 @@ void rcv_udp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
 
     if(*plen < sizeof(struct udphdr)) {
         set_pkt_meta(&i->meta, ID_PROTO_ETERM);
+        i->udp.source = 0;
+        i->udp.dest = 0;
         return;
     }
 
@@ -44,6 +46,8 @@ void rcv_tcp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
 
     if(*plen < sizeof(struct tcphdr)) {
         set_pkt_meta(&i->meta, ID_PROTO_ETERM);
+        i->tcp.source = 0;
+        i->tcp.dest = 0;
         return;
     }
 
@@ -51,6 +55,7 @@ void rcv_tcp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
 
     i->tcp.source = ntohs(h->source);
     i->tcp.dest = ntohs(h->dest);
+
     set_pkt_meta(&i->meta, ID_PROTO_TERM);
 }
 
@@ -78,18 +83,24 @@ void rcv_ipv4(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
 
     if(*plen < sizeof(struct iphdr)) {
         set_pkt_meta(&i->meta, ID_PROTO_ETERM);
+        i->ipv4.saddr.s_addr = INADDR_TEST_NET_1;
+        i->ipv4.daddr.s_addr = INADDR_TEST_NET_1;
         return;
     }
 
     struct iphdr * h = (struct iphdr *)*p;
 
-    if(h->version != 4)
+    if(h->version != 4) {
+        set_pkt_meta(&i->meta, ID_PROTO_UNKOWN);
+        i->ipv4.saddr.s_addr = INADDR_TEST_NET_1;
+        i->ipv4.daddr.s_addr = INADDR_TEST_NET_1;
         return;
+    }
 
     i->ipv4.saddr.s_addr = h->saddr;
     i->ipv4.daddr.s_addr = h->daddr;
     
-    u_char size = h->ihl * 5;
+    u_char size = h->ihl * 4;
     *p += size;
     *plen -= size;
     i->meta.nexthop = switch_ipproto(h->protocol);
@@ -119,6 +130,8 @@ void rcv_dlt_en10mb(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) 
 
     if(*plen < sizeof(struct ethhdr)) {
         set_pkt_meta(&i->meta, ID_PROTO_ETERM);
+        bzero(i->en10mb.hwsrc, ETH_ALEN);
+        bzero(i->en10mb.hwdest, ETH_ALEN);
         return;
     }
 
