@@ -223,12 +223,17 @@ struct td {
     };
 };
 
+struct rowspec {
+    uint8_t frefresh;
+};
+
 struct table {
     /* rows are first, then columns, then table cell */
     struct td ** data;
     unsigned short maxrows;
     unsigned short rows;
     unsigned short cols;
+    struct rowspec * rowspec;
 };
 
 struct globals {
@@ -330,6 +335,49 @@ struct in_addr upsert_inaddr1, upsert_inaddr2;
 
 #define in_addr_cmp(a,b) ((a).s_addr != (b).s_addr)
 
+static inline void swaprow(struct td ** tdata, u_int16_t i, u_int16_t j) {
+    if(i == j) 
+        return;
+    struct td * cpy = tdata[i];
+    tdata[i] = tdata[j];
+    tdata[j] = cpy;
+}
+
+/* 1 if bigger */
+static inline int trowcmp(struct td ** tdata, u_int16_t i, u_int16_t j) {
+    if(tdata[i][TIME_CIX].time > tdata[j][TIME_CIX].time)
+        return 1;
+    if(tdata[i][TIME_CIX].time < tdata[j][TIME_CIX].time)
+        return 0;
+    if(CVIS(COUNT_CIX))
+        return tdata[i][COUNT_CIX].uint64_val > tdata[j][COUNT_CIX].uint64_val;
+    return 0;
+}
+
+void sort(struct table * t) {
+    /* note that first rows in table is header and thus should be excluded from the sort */
+    if(t->rows < 3 || !CVIS(TIME_CIX)) 
+        return;
+
+    struct td ** tdata = t->data;
+    int len = t->rows - 1;
+
+    tdata++;
+
+    uint16_t i, j;
+
+    for(i = 6; i < len; i++) {
+        if(trowcmp(tdata, i, i-6))
+            swaprow(tdata, i, i-6);
+    }
+
+    for(i = 1; i < len; i++) {
+        for(j = i; j > 0 && trowcmp(tdata, j, j-1); j--) {
+            swaprow(tdata, j, j-1);
+        }
+    }
+}
+
 void upsert(struct table * t, struct pkt_digest * dg) {
 
     if(CVIS(IP4SADDR_CIX)) {
@@ -349,8 +397,9 @@ void upsert(struct table * t, struct pkt_digest * dg) {
     }
 
     struct td * row;
+    uint16_t i;
 
-    for(size_t i = 1; i < t->rows; i++) {
+    for(i = 1; i < t->rows; i++) {
 
         row = t->data[i];
 
@@ -382,19 +431,25 @@ void upsert(struct table * t, struct pkt_digest * dg) {
         goto UNLOCK_END;
     }
 
-    if(t->rows >= t->maxrows) {
-        return;
-    }
 
     if(pthread_spin_lock(&globals.sync)) 
         print_errno_exit(upsert:)
 
-    row = t->data[t->rows];
+    if(t->rows >= t->maxrows) {
+        row = t->data[t->rows - 1];
+        t->rowspec[t->rows - 1].frefresh = 1;
+    } else {
+        row = t->data[t->rows];
+        t->rows++;
+    }
 
     if(CVIS(IP4SADDR_CIX)) {
         if(!opts.r && globals.wladdr && !in_addr_cmp(upsert_inaddr1, globals.laddr)) {
             row[IP4SADDR_CIX].adrstart = clr_blu;
-             row[IP4SADDR_CIX].adrend = clr_norm;
+            row[IP4SADDR_CIX].adrend = clr_norm;
+        } else {
+            row[IP4SADDR_CIX].adrstart = NULL;
+            row[IP4SADDR_CIX].adrend = NULL;
         }
         row[IP4SADDR_CIX].in_addr_val = upsert_inaddr1;
     }
@@ -402,7 +457,10 @@ void upsert(struct table * t, struct pkt_digest * dg) {
     if(CVIS(IP4DADDR_CIX)) {
         if(!opts.r && globals.wladdr && !in_addr_cmp(upsert_inaddr2, globals.laddr)) {
             row[IP4DADDR_CIX].adrstart = clr_blu;
-             row[IP4DADDR_CIX].adrend = clr_norm;
+            row[IP4DADDR_CIX].adrend = clr_norm;
+        } else {
+            row[IP4DADDR_CIX].adrstart = NULL;
+            row[IP4DADDR_CIX].adrend = NULL;
         }
         row[IP4DADDR_CIX].in_addr_val = upsert_inaddr2;
     }
@@ -423,8 +481,6 @@ void upsert(struct table * t, struct pkt_digest * dg) {
        row[TIME_CIX].time = time(NULL);
     }
     
-    t->rows++;
-
 UNLOCK_END:
     pthread_spin_unlock(&globals.sync);
 }
@@ -514,6 +570,7 @@ void cleanup()
             free(globals.t.data[i]);
         }
         free(globals.t.data);
+        free(globals.t.rowspec);
     }
     puts("done");
     exit(0);
@@ -525,6 +582,8 @@ void printbl(struct table * t) {
     
     tgotoxy(0, 1);
 
+    sort(t);
+
     time_t now = time(NULL);
     
     for(size_t i = 0; i < t->rows; i++) {
@@ -533,7 +592,7 @@ void printbl(struct table * t) {
             if(!CVIS(j)) 
                 continue;
 
-            if(!t->data[i][j].cstr[0] || (!CRDONLY(j) && i > 0)) {
+            if(t->rowspec[i].frefresh || !t->data[i][j].cstr[0] || (!CRDONLY(j) && i > 0)) {
 
                 switch(CTP(j)) {
                 case CT_PKTSUM:
@@ -580,6 +639,9 @@ void printbl(struct table * t) {
                     CCSZ(j) = wrote;
             }
         }
+
+        if(t->rowspec[i].frefresh)
+            t->rowspec[i].frefresh = 0;
     }
 
     /*
@@ -599,7 +661,7 @@ void printbl(struct table * t) {
                     t->data[i][j].cstr, 
                     t->data[i][j].adrend);
             } else {
-                printf("%*.*s", csz, csz, t->data[i][j].cstr);
+                printf("%s%*.*s", clr_norm, csz, csz, t->data[i][j].cstr);
             }
         }
         puts("");
@@ -609,14 +671,15 @@ void printbl(struct table * t) {
 
 void initbl(struct table * t) {
 
-    int maxcap = 10;
+    int maxcap = 40;
     /* predefined limit + 1 to account for header row */
     t->maxrows = maxcap + 1;
     /* 1 because of header row */
     t->rows = 1;
     t->cols = sizeof(colspec)/sizeof(struct colspec);
     
-    t->data = malloc(sizeof(struct td **) * t->maxrows);
+    t->data = malloc(sizeof(struct td *) * t->maxrows);
+    t->rowspec = calloc(t->maxrows, sizeof(struct rowspec));
     for(size_t i = 0; i < t->maxrows; i++) {
         t->data[i] = calloc(t->cols, sizeof(struct td));
         struct td * row = t->data[i];
