@@ -52,11 +52,13 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 
 #define COUNT_CIX 3
 #define SIZE_CIX  4
+#define TIME_CIX  5
 
 #define CT_DOUBLE 0
 #define CT_UINT64 1
 #define CT_INADDR 2
 #define CT_PKTSUM 3
+#define CT_TIME   4
 
 struct colspec {
     char * hdr;
@@ -115,6 +117,14 @@ struct colspec {
         .visible = 1,
         .readonly = 0,
     },
+    {
+        .hdr = "LTIME",
+        .c_size = 6,
+        .max_size = 10,
+        .coltype = CT_TIME,
+        .visible = 1,
+        .readonly = 0
+    }
 };
 
 
@@ -209,6 +219,7 @@ struct td {
         uint64_t uint64_val;
         struct in_addr in_addr_val;
         proto_t proto;
+        time_t time;
     };
 };
 
@@ -238,8 +249,8 @@ struct globals {
     .rthr = 0,
 };
 
-int
-snprintf_size(char *buf, int blen, double size) {
+/* size in bytes to human readable form */
+int snprintf_size(char *buf, int blen, double size) {
     int i = 0;
     const char units[] = {'B', 'K', 'M', 'G', 'T', 'P'};
     while (size > 1024) {
@@ -249,6 +260,46 @@ snprintf_size(char *buf, int blen, double size) {
     }
     if(i > 2) i = 2;
     return snprintf(buf, blen, "%.*lf%c", i, size, units[i]);
+}
+
+#define MIN  60
+#define HR  ((MIN) * 60)
+#define DAY ((HR) * 24)
+
+/* time in secondas to human readable form */
+int snprintf_time(char * buf, int blen, time_t time) {
+    struct {
+        uint32_t noday;     /* max = a lot */
+        uint32_t nohr  :5;  /* max 24 */
+        uint32_t nomin :6; /* max 60 */
+        uint32_t nosec :6; /* max 60 */
+        uint32_t _pad  :15;
+    } x = {0};
+    while(time >= DAY) {
+        time -= DAY;
+        x.noday++;
+    }
+    while(time >= HR) {
+        time -= HR;
+        x.nohr++;
+    }
+    while(time >= MIN) {
+        time -= MIN;
+        x.nomin++;
+    }
+    x.nosec = time;
+
+    int wrote = 0;
+    if(x.noday)
+        wrote += snprintf(buf+wrote, blen-wrote, "%ud", x.noday);
+    if(x.nohr && (blen-wrote > 1))
+        wrote += snprintf(buf+wrote, blen-wrote, "%uh", x.nohr);
+    if(x.nomin && (blen-wrote > 1))
+        wrote += snprintf(buf+wrote, blen-wrote, "%um", x.nomin);
+    if((blen-wrote) > 1)
+        wrote = snprintf(buf+wrote, blen-wrote, "%us", x.nosec);
+
+    return wrote;
 }
 
 double atof_size(char * sizestr) {
@@ -275,17 +326,26 @@ double atof_size(char * sizestr) {
 }
 
 
-struct in_addr upsert_inaddr;
+struct in_addr upsert_inaddr1, upsert_inaddr2;
 
 #define in_addr_cmp(a,b) ((a).s_addr != (b).s_addr)
 
 void upsert(struct table * t, struct pkt_digest * dg) {
 
     if(CVIS(IP4SADDR_CIX)) {
-        if(dg->meta.proto_flags&IDF(ID_IPV4))
-            upsert_inaddr = dg->ipv4.saddr;
-        else
-            upsert_inaddr.s_addr = INADDR_TEST_NET_1;
+        if(dg->meta.proto_flags&IDF(ID_IPV4)) {
+            upsert_inaddr1 = dg->ipv4.saddr;
+        } else {
+            upsert_inaddr1.s_addr = INADDR_TEST_NET_1;
+        }
+    }
+
+    if(CVIS(IP4DADDR_CIX)) {
+        if(dg->meta.proto_flags&IDF(ID_IPV4)) {
+            upsert_inaddr2 = dg->ipv4.daddr;
+        } else {
+            upsert_inaddr2.s_addr = INADDR_TEST_NET_1;
+        }
     }
 
     struct td * row;
@@ -297,7 +357,10 @@ void upsert(struct table * t, struct pkt_digest * dg) {
         if(CVIS(SUMMARY_CIX) && dg->meta.proto_flags != row[SUMMARY_CIX].proto)
             continue;
         
-        if(CVIS(IP4SADDR_CIX) && in_addr_cmp(row[IP4SADDR_CIX].in_addr_val, upsert_inaddr))
+        if(CVIS(IP4SADDR_CIX) && in_addr_cmp(row[IP4SADDR_CIX].in_addr_val, upsert_inaddr1))
+            continue;
+
+        if(CVIS(IP4DADDR_CIX) && in_addr_cmp(row[IP4DADDR_CIX].in_addr_val, upsert_inaddr2))
             continue;
 
         /* row is the same => update facts */
@@ -312,6 +375,10 @@ void upsert(struct table * t, struct pkt_digest * dg) {
             row[SIZE_CIX].uint64_val += dg->meta.total_len;
         }
 
+        if(CVIS(TIME_CIX)) {
+            row[TIME_CIX].time = time(NULL);
+        }
+
         goto UNLOCK_END;
     }
 
@@ -322,24 +389,38 @@ void upsert(struct table * t, struct pkt_digest * dg) {
     if(pthread_spin_lock(&globals.sync)) 
         print_errno_exit(upsert:)
 
+    row = t->data[t->rows];
+
     if(CVIS(IP4SADDR_CIX)) {
-        if(globals.wladdr && !in_addr_cmp(upsert_inaddr, globals.laddr)) {
-            t->data[t->rows][IP4SADDR_CIX].adrstart = clr_blu;
-             t->data[t->rows][IP4SADDR_CIX].adrend = clr_norm;
+        if(!opts.r && globals.wladdr && !in_addr_cmp(upsert_inaddr1, globals.laddr)) {
+            row[IP4SADDR_CIX].adrstart = clr_blu;
+             row[IP4SADDR_CIX].adrend = clr_norm;
         }
-        t->data[t->rows][IP4SADDR_CIX].in_addr_val = upsert_inaddr;
+        row[IP4SADDR_CIX].in_addr_val = upsert_inaddr1;
+    }
+
+    if(CVIS(IP4DADDR_CIX)) {
+        if(!opts.r && globals.wladdr && !in_addr_cmp(upsert_inaddr2, globals.laddr)) {
+            row[IP4DADDR_CIX].adrstart = clr_blu;
+             row[IP4DADDR_CIX].adrend = clr_norm;
+        }
+        row[IP4DADDR_CIX].in_addr_val = upsert_inaddr2;
     }
 
     if(CVIS(COUNT_CIX)) {
-        t->data[t->rows][COUNT_CIX].uint64_val = 1;
+        row[COUNT_CIX].uint64_val = 1;
     }
 
     if(CVIS(SIZE_CIX)) {
-        t->data[t->rows][SIZE_CIX].uint64_val = dg->meta.total_len;
+        row[SIZE_CIX].uint64_val = dg->meta.total_len;
     }
 
     if(CVIS(SUMMARY_CIX)) {
-        t->data[t->rows][SUMMARY_CIX].proto = dg->meta.proto_flags;
+        row[SUMMARY_CIX].proto = dg->meta.proto_flags;
+    }
+
+    if(CVIS(TIME_CIX)) {
+       row[TIME_CIX].time = time(NULL);
     }
     
     t->rows++;
@@ -381,7 +462,7 @@ int get_device_info() {
 
 /*
     since pcap will run rcv_pkt in single thread it should be ok to
-    to store info from currently processed packet in global variable.
+    to store info of currently processed packet in global variable.
 */
 struct pkt_digest pkt_digest;
 
@@ -443,6 +524,8 @@ void printbl(struct table * t) {
     unsigned short csz;
     
     tgotoxy(0, 1);
+
+    time_t now = time(NULL);
     
     for(size_t i = 0; i < t->rows; i++) {
         for(size_t j = 0; j < t->cols; j++) {
@@ -480,6 +563,12 @@ void printbl(struct table * t) {
                         "%lu", t->data[i][j].uint64_val);
 
                     break;
+                case CT_TIME:
+                    if(now < 1 || t->data[i][j].time < 1)
+                        wrote = sprintf(t->data[i][j].cstr, "?");
+                    else
+                        wrote = snprintf_time(t->data[i][j].cstr, MCSZ(j), now - t->data[i][j].time);
+                    break;
                 default:
 
                     wrote = sprintf(t->data[i][j].cstr, "?");
@@ -492,6 +581,11 @@ void printbl(struct table * t) {
             }
         }
     }
+
+    /*
+        other loop is needed because certain cells could resize whole column,
+        so im iterating over them first, and then drawing.
+    */
 
     for(size_t i = 0; i < t->rows; i++) {
         for(size_t j = 0; j < t->cols; j++) {
