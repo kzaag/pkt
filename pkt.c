@@ -45,9 +45,9 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 
 /* indexes for specified columns within colspec */
 #define SUMMARY_CIX   0
-/* IPv4 address pair */
-#define IP4SADDR_CIX  1
-#define IP4DADDR_CIX  2
+/* IPv4/v6 address pair */
+#define IPSADDR_CIX  1
+#define IPDADDR_CIX  2
 /* UDP/TCP port pair */
 #define SRC_CIX       3
 #define DST_CIX       4
@@ -64,12 +64,15 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 #define CT_PKTSUM 3
 #define CT_TIME   4
 #define CT_UINT16 5
+#define CT_IN6ADDR 6
+
+typedef u_char celltype_t;
 
 struct colspec {
     char * hdr;
     uint16_t max_size;
     uint16_t c_size;
-    u_char coltype;
+    celltype_t coltype;
     u_char visible  : 1;
     /* if set to 0 will indicate that column value may change, 
         and cstr must be updated on every display */
@@ -86,19 +89,21 @@ struct colspec {
         .readonly = 1,
     },
     {         
-        .hdr = "IPV4SADDR",
+        .hdr = "IPSADDR",
         .c_size = 11,
-        /* xxx.xxx.xxx.xxx\0 */
-        .max_size = 16,
+        /* ipv4/v6 */
+        .max_size = 61,
+        /* by default ipv4 */
         .coltype = CT_INADDR,
         .visible = 0,
         .readonly = 1,
     },
     {         
-        .hdr = "IPV4DADDR",
+        .hdr = "IPDADDR",
         .c_size = 11,
-        /* xxx.xxx.xxx.xxx\0 */
-        .max_size = 16,
+        /* ipv4/v6 */
+        .max_size = 61,
+        /* by default ipv4 */
         .coltype = CT_INADDR,
         .visible = 0,
         .readonly = 1,
@@ -197,10 +202,10 @@ int init_opts(int argc, char * argv[])
                     CVIS(SUMMARY_CIX) = 1;
                     break;
                 case 'z':
-                    CVIS(IP4SADDR_CIX) = 1;
+                    CVIS(IPSADDR_CIX) = 1;
                     break;
                 case 'x':
-                    CVIS(IP4DADDR_CIX) = 1;
+                    CVIS(IPDADDR_CIX) = 1;
                     break;
                 case 'c':
                     CVIS(SRC_CIX) = 1;
@@ -247,9 +252,11 @@ struct td {
     char * cstr;
     const char * adrstart;
     const char * adrend;
+    celltype_t celltype;
     union {
         uint64_t uint64_val;
         uint16_t uint16v;
+        struct in6_addr in6_addr_val;
         struct in_addr in_addr_val;
         proto_t proto;
         time_t time;
@@ -273,8 +280,13 @@ struct table {
 
 struct globals {
     pcap_t * pcap_handle;
+
     struct in_addr laddr;
     u_char wladdr;
+
+    struct in6_addr laddr6;
+    u_char wladdr6;
+
     int dlt;
     struct table t;
     pthread_t rthr;
@@ -283,6 +295,7 @@ struct globals {
     .pcap_handle = NULL,
     .wladdr = 0,
     .dlt = -1,
+    .wladdr6 = 0,
     .t = {
         .data = NULL
     },
@@ -414,48 +427,128 @@ void sort(struct table * t) {
     }
 }
 
-#define FORMAT_INADDR(a, b) (!opts.r && globals.wladdr && !in_addr_cmp(a, b))
+/* determines if specified address is local on the interface and can be pretty printed */
+#define FORMAT_INADDR(a) (!opts.r && globals.wladdr && !in_addr_cmp((a), globals.laddr))
+/* same as FORMAT_INADDR but for ipv6, a must be pointer to in6_addr */
+#define FORMAT_IN6ADDR(a) (!opts.r && globals.wladdr6 && !memcmp((a), &globals.laddr6, sizeof(struct in6_addr))) 
+
+/* check if digest contains specified proto_id */
+static inline int isproto(struct pkt_digest * dg, proto_t id) {
+    return dg->meta.proto_flags&IDF(id);
+}
+
+/* 
+    determines if specified packet should be grouped with row
+    cix is column index. this can be either IPSADDR_CIX or IPSADDR_CIX
+    returns 1 if packet matches or if column is not visible, otherwise returns 0 
+*/
+static inline int groupip(struct pkt_digest * dg, int cix, struct td * row) {
+    if(CVIS(cix)){
+        if(isproto(dg, ID_IPV4)) {
+            if(in_addr_cmp(row[cix].in_addr_val, cix == IPSADDR_CIX ? dg->ipv4.saddr : dg->ipv4.daddr))
+                return 0;
+        } else if(isproto(dg, ID_IPV6)) {
+            if(memcmp(cix == IPSADDR_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr, &row[cix].in6_addr_val, sizeof(struct in6_addr)))
+                return 0;
+        } else if(row[cix].in_addr_val.s_addr != INADDR_TEST_NET_1) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+    set cell specified by column index (cix) and row to ip value 
+    do nothing if column is not visible
+    cix may be IPSADDR_CIX or IPDADDR_CIX
+*/
+static inline void setipcell(struct pkt_digest * dg, int cix, struct td * row) {
+    if(!CVIS(cix)) {
+        return;
+    }
+
+    if(isproto(dg, ID_IPV4)) {
+        struct in_addr a =  cix == IPSADDR_CIX ? dg->ipv4.saddr : dg->ipv4.daddr;
+        row[cix].celltype = 0; /* return type to default - ipv4 */
+        row[cix].in_addr_val = a;
+        if(FORMAT_INADDR(a)) {
+            row[cix].adrstart = clr_local;
+            row[cix].adrend = clr_norm;
+        } else {
+            row[cix].adrstart = NULL;
+            row[cix].adrend = NULL;
+        }
+    } else if(isproto(dg, ID_IPV6)) {
+        struct in6_addr * i6 =  cix == IPSADDR_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr;
+        row[cix].celltype = CT_IN6ADDR; /* override default column typ to ipv6 */
+        row[cix].in6_addr_val = *i6;
+        if(FORMAT_IN6ADDR(i6)) {
+            row[cix].adrstart = clr_local;
+            row[cix].adrend = clr_norm;
+        } else {
+            row[cix].adrstart = NULL;
+            row[cix].adrend = NULL;
+        }
+    } else {
+        row[cix].celltype = 0;
+        row[cix].in_addr_val.s_addr = INADDR_TEST_NET_1;
+        row[cix].adrstart = NULL;
+        row[cix].adrend = NULL;
+    }
+}
+
+/* 
+    determines if specified packet should be grouped with row
+    cix is column index. this can be either SRC_CIX or DST_CIX
+    returns 1 if packet matches or if column is not visible, otherwise returns 0 
+*/
+static inline int group_port(struct pkt_digest * dg, int cix, struct td * row) {
+    if(CVIS(cix)){
+        if(isproto(dg, ID_TCP)) {
+            if((cix == SRC_CIX ? dg->tcp.source : dg->tcp.dest) != row[cix].uint16v) {
+                return 0;
+            }
+        } else if(isproto(dg, ID_UDP)) {
+            if((cix == SRC_CIX ? dg->udp.source : dg->udp.dest) != row[cix].uint16v) {
+                return 0;
+            }
+        } else if(!row[cix].uint16v) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+    set cell specified by column index (cix) and row to tcp / udp port value 
+    do nothing if column is not visible
+    cix may be SRC_CIX or DST_CIX
+*/
+static inline void setportcell(struct pkt_digest * dg, int cix, struct td * row) {
+    if(!CVIS(cix))
+        return;
+
+    if(isproto(dg, ID_UDP)) {
+        row[cix].uint16v = (cix == SRC_CIX ? dg->udp.source : dg->udp.dest);
+    } else if(isproto(dg, ID_TCP)) {
+        row[cix].uint16v = (cix == SRC_CIX ? dg->tcp.source : dg->tcp.dest);
+    } else {
+        row[cix].uint16v = 0;
+    }
+
+    if(
+        ( isproto(dg, ID_IPV4) && FORMAT_INADDR(cix == SRC_CIX ? dg->ipv4.saddr : dg->ipv4.daddr) ) ||
+        ( isproto(dg, ID_IPV6) && FORMAT_IN6ADDR(cix == SRC_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr))
+    ) {
+        row[cix].adrstart = clr_local;
+        row[cix].adrend = clr_norm;
+    } else {
+        row[cix].adrstart = NULL;
+        row[cix].adrend = NULL;
+    }
+}
 
 void upsert(struct table * t, struct pkt_digest * dg) {
-    struct in_addr inaddr1, inaddr2;
-    uint16_t uint16_1, uint16_2;
-
-
-    if(CVIS(IP4SADDR_CIX)) {
-        if(dg->meta.proto_flags&IDF(ID_IPV4)) {
-            inaddr1 = dg->ipv4.saddr;
-        } else {
-            inaddr1.s_addr = INADDR_TEST_NET_1;
-        }
-    }
-
-    if(CVIS(IP4DADDR_CIX)) {
-        if(dg->meta.proto_flags&IDF(ID_IPV4)) {
-            inaddr2 = dg->ipv4.daddr;
-        } else {
-            inaddr2.s_addr = INADDR_TEST_NET_1;
-        }
-    }
-
-    if(CVIS(SRC_CIX)) {
-        if(dg->meta.proto_flags&IDF(ID_UDP)) {
-            uint16_1 = dg->udp.source;
-        } else if(dg->meta.proto_flags&IDF(ID_TCP)) {
-            uint16_1 = dg->tcp.source;
-        } else {
-            uint16_1 = 0;
-        }
-    }
-
-    if(CVIS(DST_CIX)) {
-        if(dg->meta.proto_flags&IDF(ID_UDP)) {
-            uint16_2 = dg->udp.dest;
-        } else if(dg->meta.proto_flags&IDF(ID_TCP)) {
-            uint16_2 = dg->tcp.dest;
-        } else {
-            uint16_2 = 0;
-        }
-    }
 
     struct td * row;
     uint16_t i;
@@ -470,17 +563,18 @@ void upsert(struct table * t, struct pkt_digest * dg) {
         if(CVIS(SUMMARY_CIX) && dg->meta.proto_flags != row[SUMMARY_CIX].proto)
             continue;
         
-        if(CVIS(IP4SADDR_CIX) && in_addr_cmp(row[IP4SADDR_CIX].in_addr_val, inaddr1))
+        if(!groupip(dg, IPSADDR_CIX, row))
             continue;
 
-        if(CVIS(IP4DADDR_CIX) && in_addr_cmp(row[IP4DADDR_CIX].in_addr_val, inaddr2))
+        if(!groupip(dg, IPDADDR_CIX, row))
             continue;
 
-        if(CVIS(SRC_CIX) && uint16_1 != row[SRC_CIX].uint16v)
+        if(!group_port(dg, SRC_CIX, row))
             continue;
 
-        if(CVIS(DST_CIX) && uint16_2 != row[DST_CIX].uint16v)
+        if(!group_port(dg, DST_CIX, row))
             continue;
+
 
         /* row is the same => update facts */
 
@@ -507,49 +601,11 @@ void upsert(struct table * t, struct pkt_digest * dg) {
         t->rows++;
     }
 
-    if(CVIS(IP4SADDR_CIX)) {
-        if(FORMAT_INADDR(inaddr1, globals.laddr)) {
-            row[IP4SADDR_CIX].adrstart = clr_local;
-            row[IP4SADDR_CIX].adrend = clr_norm;
-        } else {
-            row[IP4SADDR_CIX].adrstart = NULL;
-            row[IP4SADDR_CIX].adrend = NULL;
-        }
-        row[IP4SADDR_CIX].in_addr_val = inaddr1;
-    }
+    setipcell(dg, IPSADDR_CIX, row);
+    setipcell(dg, IPDADDR_CIX, row);
 
-    if(CVIS(IP4DADDR_CIX)) {
-        if(FORMAT_INADDR(inaddr2, globals.laddr)) {
-            row[IP4DADDR_CIX].adrstart = clr_local;
-            row[IP4DADDR_CIX].adrend = clr_norm;
-        } else {
-            row[IP4DADDR_CIX].adrstart = NULL;
-            row[IP4DADDR_CIX].adrend = NULL;
-        }
-        row[IP4DADDR_CIX].in_addr_val = inaddr2;
-    }
-
-    if(CVIS(SRC_CIX)) {
-        if(dg->meta.proto_flags&IDF(ID_IPV4) && FORMAT_INADDR(dg->ipv4.saddr, globals.laddr)) {
-            row[SRC_CIX].adrstart = clr_local;
-            row[SRC_CIX].adrend = clr_norm;
-        } else {
-            row[SRC_CIX].adrstart = NULL;
-            row[SRC_CIX].adrend = NULL;
-        }
-        row[SRC_CIX].uint16v = uint16_1;
-    }
-
-    if(CVIS(DST_CIX)) {
-        if(dg->meta.proto_flags&IDF(ID_IPV4) && FORMAT_INADDR(dg->ipv4.daddr, globals.laddr)) {
-            row[DST_CIX].adrstart = clr_local;
-            row[DST_CIX].adrend = clr_norm;
-        } else {
-            row[DST_CIX].adrstart = NULL;
-            row[DST_CIX].adrend = NULL;
-        }
-        row[DST_CIX].uint16v = uint16_2;
-    }
+    setportcell(dg, SRC_CIX, row);
+    setportcell(dg, DST_CIX, row);
 
     if(CVIS(COUNT_CIX)) {
         row[COUNT_CIX].uint64_val = 1;
@@ -670,6 +726,8 @@ void printbl(struct table * t) {
 
     time_t now = time(NULL);
 
+    celltype_t celltype;
+
     for(size_t i = 0; i < t->rows; i++) {
         for(size_t j = 0; j < t->cols; j++) {
 
@@ -678,7 +736,12 @@ void printbl(struct table * t) {
 
             if(t->rowspec[i].frefresh || !t->data[i][j].cstr[0] || (!CRDONLY(j) && i > 0)) {
 
-                switch(CTP(j)) {
+                celltype = t->data[i][j].celltype;
+                if(!celltype) {
+                    celltype = CTP(j);
+                }
+
+                switch(celltype) {
                 case CT_PKTSUM:
                     wrote = sprintf_proto(t->data[i][j].cstr, t->data[i][j].proto);
                     break;
@@ -694,7 +757,7 @@ void printbl(struct table * t) {
                     } else {
                         wrote = snprintf(
                             t->data[i][j].cstr, 
-                            MCSZ(IP4SADDR_CIX), 
+                            MCSZ(IPSADDR_CIX), 
                             inet_ntoa(t->data[i][j].in_addr_val));
                     }
 
@@ -721,6 +784,12 @@ void printbl(struct table * t) {
                         wrote = sprintf(t->data[i][j].cstr, "?");
                     else
                         wrote = snprintf_time(t->data[i][j].cstr, MCSZ(j), now - t->data[i][j].time);
+                    break;
+                case CT_IN6ADDR:
+                    if(inet_ntop(AF_INET6, &t->data[i][j].in6_addr_val, t->data[i][j].cstr, MCSZ(j)))
+                        wrote = strlen(t->data[i][j].cstr);
+                    else
+                        wrote = sprintf(t->data[i][j].cstr, "!(err=%d)", errno);
                     break;
                 default:
 
@@ -767,7 +836,7 @@ void printbl(struct table * t) {
 
 void initbl(struct table * t) {
 
-    int maxcap = 10;
+    int maxcap = 20;
     /* predefined limit + 1 to account for header row */
     t->maxrows = maxcap + 1;
     /* 1 because of header row */

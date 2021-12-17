@@ -85,6 +85,8 @@ struct pkt_digest
         struct
         {
             u_char next_header;
+            struct in6_addr saddr;
+            struct in6_addr daddr;
         } ipv6;
     };
 

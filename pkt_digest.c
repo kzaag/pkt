@@ -8,6 +8,7 @@
 #include <linux/ipv6.h>
 #include <linux/udp.h>
 #include <linux/if_pppox.h>
+#include <asm/byteorder.h>
 
 #define RETURN_RCV { *next = NULL; return; }
 
@@ -78,8 +79,35 @@ pktcallback switch_ipproto(unsigned char proto) {
     }
 }
 
+#define IN6ADDR_TEST_INIT { { { 32,1,13,184,255,255,255,255,255,5,245,155,245,45,112,22 } } }
+
+const struct in6_addr in6addr_test =  IN6ADDR_TEST_INIT;
+
 void rcv_ipv6(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
     set_pkt_meta(&i->meta, ID_IPV6);
+
+    if(*plen < sizeof(struct ipv6hdr)) {
+        set_pkt_meta(&i->meta, ID_PROTO_ETERM);
+        i->ipv6.saddr = in6addr_test;
+        i->ipv6.daddr = in6addr_test;
+        return;
+    }
+    
+    struct ipv6hdr * h = (struct ipv6hdr *)*p;
+
+    if(h->version != 6) {
+        set_pkt_meta(&i->meta, ID_PROTO_UNKOWN);
+        i->ipv6.saddr = in6addr_test;
+        i->ipv6.daddr = in6addr_test;
+        return;
+    }
+
+    i->ipv6.saddr = h->saddr;
+    i->ipv6.daddr = h->daddr;
+
+    *p += sizeof(struct ipv6hdr);
+    *plen -= sizeof(struct ipv6hdr);
+    i->meta.nexthop = switch_ipproto(h->nexthdr);
 }
 
 void rcv_ipv4(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
