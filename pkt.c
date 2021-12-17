@@ -240,6 +240,9 @@ const char * clr_mag = "\x1B[35m";
 const char * clr_cyn = "\x1B[36m";
 const char * clr_wht = "\x1B[37m";
 
+/* this color is used to display local data such as local ports, local addresses, ... */
+#define clr_local clr_mag
+
 struct td {
     char * cstr;
     const char * adrstart;
@@ -285,6 +288,7 @@ struct globals {
     },
     .rthr = 0,
 };
+
 
 /* size in bytes to human readable form */
 int snprintf_size(char *buf, int blen, double size) {
@@ -410,6 +414,8 @@ void sort(struct table * t) {
     }
 }
 
+#define FORMAT_INADDR(a, b) (!opts.r && globals.wladdr && !in_addr_cmp(a, b))
+
 void upsert(struct table * t, struct pkt_digest * dg) {
     struct in_addr inaddr1, inaddr2;
     uint16_t uint16_1, uint16_2;
@@ -502,8 +508,8 @@ void upsert(struct table * t, struct pkt_digest * dg) {
     }
 
     if(CVIS(IP4SADDR_CIX)) {
-        if(!opts.r && globals.wladdr && !in_addr_cmp(inaddr1, globals.laddr)) {
-            row[IP4SADDR_CIX].adrstart = clr_blu;
+        if(FORMAT_INADDR(inaddr1, globals.laddr)) {
+            row[IP4SADDR_CIX].adrstart = clr_local;
             row[IP4SADDR_CIX].adrend = clr_norm;
         } else {
             row[IP4SADDR_CIX].adrstart = NULL;
@@ -513,8 +519,8 @@ void upsert(struct table * t, struct pkt_digest * dg) {
     }
 
     if(CVIS(IP4DADDR_CIX)) {
-        if(!opts.r && globals.wladdr && !in_addr_cmp(inaddr2, globals.laddr)) {
-            row[IP4DADDR_CIX].adrstart = clr_blu;
+        if(FORMAT_INADDR(inaddr2, globals.laddr)) {
+            row[IP4DADDR_CIX].adrstart = clr_local;
             row[IP4DADDR_CIX].adrend = clr_norm;
         } else {
             row[IP4DADDR_CIX].adrstart = NULL;
@@ -524,9 +530,24 @@ void upsert(struct table * t, struct pkt_digest * dg) {
     }
 
     if(CVIS(SRC_CIX)) {
+        if(dg->meta.proto_flags&IDF(ID_IPV4) && FORMAT_INADDR(dg->ipv4.saddr, globals.laddr)) {
+            row[SRC_CIX].adrstart = clr_local;
+            row[SRC_CIX].adrend = clr_norm;
+        } else {
+            row[SRC_CIX].adrstart = NULL;
+            row[SRC_CIX].adrend = NULL;
+        }
         row[SRC_CIX].uint16v = uint16_1;
     }
+
     if(CVIS(DST_CIX)) {
+        if(dg->meta.proto_flags&IDF(ID_IPV4) && FORMAT_INADDR(dg->ipv4.daddr, globals.laddr)) {
+            row[DST_CIX].adrstart = clr_local;
+            row[DST_CIX].adrend = clr_norm;
+        } else {
+            row[DST_CIX].adrstart = NULL;
+            row[DST_CIX].adrend = NULL;
+        }
         row[DST_CIX].uint16v = uint16_2;
     }
 
@@ -723,8 +744,6 @@ void printbl(struct table * t) {
         other loop is needed because certain cells could resize whole column,
         so im iterating over all of them first, and then drawing.
     */
-
-   char foob[30];
 
     for(size_t i = 0; i < t->rows; i++) {
         for(size_t j = 0; j < t->cols; j++) {
