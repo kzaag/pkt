@@ -78,6 +78,10 @@ pktcallback switch_ipproto(unsigned char proto) {
     }
 }
 
+void rcv_ipv6(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
+    set_pkt_meta(&i->meta, ID_IPV6);
+}
+
 void rcv_ipv4(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
     set_pkt_meta(&i->meta, ID_IPV4);
 
@@ -114,6 +118,7 @@ static inline pktcallback switch_on_ppp_dll_proto(uint16_t tt) {
     case PPP_DLL_IPV4:
         return rcv_ipv4;
     case PPP_DLL_IPV6:
+        return rcv_ipv6;
     default:
         return NULL;
     }
@@ -153,6 +158,7 @@ pktcallback switch_ethertype(u_int16_t ethtype) {
     case ETH_P_PPP_SES:
         return rcv_ppp_ses;
     case ETH_P_IPV6:
+        return rcv_ipv6;
     case ETH_P_ARP:
     case ETH_P_PPP_DISC:
     default:
@@ -231,6 +237,7 @@ const char * PROTO_ID_STR[] = {
     "ETH",  /* ID_EN10MB */
     "PPPS", /* ID_PPPSES */
     "IP4",  /* ID_IPV4 */
+    "IP6",  /* ID_IPV6 */
     "TCP",  /* ID_TCP */
     "UDP",  /* ID_UDP */
     "ICMP", /* ID_ICMP */

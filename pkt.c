@@ -263,6 +263,8 @@ struct table {
     unsigned short maxrows;
     unsigned short rows;
     unsigned short cols;
+    /* be very careful when handling this array.
+        data may be sorted and reordered. In that case rowspec will refer to wrong rows */
     struct rowspec * rowspec;
 };
 
@@ -382,6 +384,8 @@ static inline int trowcmp(struct td ** tdata, u_int16_t i, u_int16_t j) {
     return 0;
 }
 
+/* note that this won't sort rowspec. 
+    So make sure to remove any meaningful data from rowspec before calling sort*/
 void sort(struct table * t) {
     /* note that first rows in table is header and thus should be excluded from the sort */
     if(t->rows < 3 || !CVIS(TIME_CIX)) 
@@ -450,6 +454,9 @@ void upsert(struct table * t, struct pkt_digest * dg) {
     struct td * row;
     uint16_t i;
 
+    if(pthread_spin_lock(&globals.sync)) 
+        print_errno_exit(upsert:)
+
     for(i = 1; i < t->rows; i++) {
 
         row = t->data[i];
@@ -470,8 +477,6 @@ void upsert(struct table * t, struct pkt_digest * dg) {
             continue;
 
         /* row is the same => update facts */
-        if(pthread_spin_lock(&globals.sync)) 
-            print_errno_exit(upsert:)
 
         if(CVIS(COUNT_CIX)) {
             row[COUNT_CIX].uint64_val++;
@@ -487,10 +492,6 @@ void upsert(struct table * t, struct pkt_digest * dg) {
 
         goto UNLOCK_END;
     }
-
-
-    if(pthread_spin_lock(&globals.sync)) 
-        print_errno_exit(upsert:)
 
     if(t->rows >= t->maxrows) {
         row = t->data[t->rows - 1];
@@ -646,10 +647,8 @@ void printbl(struct table * t) {
     
     tgotoxy(0, 1);
 
-    sort(t);
-
     time_t now = time(NULL);
-    
+
     for(size_t i = 0; i < t->rows; i++) {
         for(size_t j = 0; j < t->cols; j++) {
 
@@ -718,10 +717,14 @@ void printbl(struct table * t) {
             t->rowspec[i].frefresh = 0;
     }
 
+    sort(t);
+
     /*
         other loop is needed because certain cells could resize whole column,
-        so im iterating over them first, and then drawing.
+        so im iterating over all of them first, and then drawing.
     */
+
+   char foob[30];
 
     for(size_t i = 0; i < t->rows; i++) {
         for(size_t j = 0; j < t->cols; j++) {
@@ -735,7 +738,7 @@ void printbl(struct table * t) {
                     t->data[i][j].cstr, 
                     t->data[i][j].adrend);
             } else {
-                printf("%s%*.*s", clr_norm, csz, csz, t->data[i][j].cstr);
+                printf("%*.*s", csz, csz, t->data[i][j].cstr);
             }
         }
         puts("");
@@ -745,7 +748,7 @@ void printbl(struct table * t) {
 
 void initbl(struct table * t) {
 
-    int maxcap = 40;
+    int maxcap = 10;
     /* predefined limit + 1 to account for header row */
     t->maxrows = maxcap + 1;
     /* 1 because of header row */
