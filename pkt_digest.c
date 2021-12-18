@@ -111,6 +111,7 @@ void rcv_ipv6(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
 }
 
 void rcv_ipv4(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
+
     set_pkt_meta(&i->meta, ID_IPV4);
 
     if(*plen < sizeof(struct iphdr)) {
@@ -176,6 +177,13 @@ void rcv_ppp_ses(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
     i->meta.nexthop = switch_on_ppp_dll_proto(t);
 }
 
+
+void rcv_arp(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
+    set_pkt_meta(&i->meta, ID_ARP);
+    set_pkt_meta(&i->meta, ID_PROTO_TERM);
+}
+
+
 /*
     return next handler for packet inside link frame
 */
@@ -188,6 +196,7 @@ pktcallback switch_ethertype(u_int16_t ethtype) {
     case ETH_P_IPV6:
         return rcv_ipv6;
     case ETH_P_ARP:
+        return rcv_arp;
     case ETH_P_PPP_DISC:
     default:
         return NULL;
@@ -263,9 +272,13 @@ void sprintf_hwaddr(char * buff, u_char * hwaddr) {
 const char * PROTO_ID_STR[] = {
     "SLL",  /* ID_LINUX_SLL */
     "ETH",  /* ID_EN10MB */
+    
     "PPPS", /* ID_PPPSES */
+
     "IP4",  /* ID_IPV4 */
     "IP6",  /* ID_IPV6 */
+    "ARP",  /* AD_ARP */
+
     "TCP",  /* ID_TCP */
     "UDP",  /* ID_UDP */
     "ICMP", /* ID_ICMP */

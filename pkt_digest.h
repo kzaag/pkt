@@ -17,12 +17,13 @@ typedef uint16_t proto_t;
 
 #define ID_IPV4       3
 #define ID_IPV6       4
+#define ID_ARP        5
 
-#define ID_TCP        5
-#define ID_UDP        6
-#define ID_ICMP       7
+#define ID_TCP        6
+#define ID_UDP        7
+#define ID_ICMP       8
 
-#define ID_PROTO_START 8
+#define ID_PROTO_START 9
 
 /* packet terminated unexpectedly */
 #define ID_PROTO_ETERM (ID_PROTO_START)

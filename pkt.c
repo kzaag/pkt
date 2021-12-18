@@ -512,7 +512,7 @@ static inline int group_port(struct pkt_digest * dg, int cix, struct td * row) {
             if((cix == SRC_CIX ? dg->udp.source : dg->udp.dest) != row[cix].uint16v) {
                 return 0;
             }
-        } else if(!row[cix].uint16v) {
+        } else if(row[cix].uint16v) {
             return 0;
         }
     }
