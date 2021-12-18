@@ -10,8 +10,6 @@
 
 #include "pkt_digest.h"
 
-/* unlikely ip addresses which we may use for testing */
-
 static char pcaperr[PCAP_ERRBUF_SIZE];
 
 #define print_errno(hdr) fprintf(stderr, #hdr " %s\n", errno ? strerror(errno) : "unkown error");
