@@ -351,7 +351,7 @@ int snprintf_time(char * buf, int blen, time_t time) {
     if(x.nomin && (blen-wrote > 1))
         wrote += snprintf(buf+wrote, blen-wrote, "%um", x.nomin);
     if((blen-wrote) > 1)
-        wrote = snprintf(buf+wrote, blen-wrote, "%us", x.nosec);
+        wrote += snprintf(buf+wrote, blen-wrote, "%us", x.nosec);
 
     return wrote;
 }
