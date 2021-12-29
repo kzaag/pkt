@@ -7,40 +7,120 @@
 #include <linux/tcp.h>
 #include <signal.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <linux/if_pppox.h>
+#include <stdarg.h>
+#include <sys/time.h>
 
 #include "pkt_digest.h"
 
-/* unlikely ip addresses which we may use for testing */
-
+/* buffer for pcap error string */
 static char pcaperr[PCAP_ERRBUF_SIZE];
 
-#define print_errno(hdr) fprintf(stderr, #hdr " %s\n", errno ? strerror(errno) : "unkown error");
-#define print_errno_ret(hdr) { \
-    print_errno(hdr);            \
-    return 1;                       \
-}
-#define print_errno_exit(hdr) {     \
-    print_errno(hdr);                \
-    exit(1);                         \
+#if defined(DBG)
+
+static int dfd = 0;
+
+static const char timefmt[] = "%Y-%m-%d %H:%M:%S: ";
+
+
+#define pkt_log(cstr) pkt_logf(cstr); 
+
+#define LOG_BUFF_SIZE 1024
+
+static __thread char logbuffer[LOG_BUFF_SIZE];
+
+static int strftimenow() {
+	time_t t = time(NULL);
+	if(t == (time_t)-1)
+		return 0;
+	struct tm tm;
+	localtime_r(&t, &tm);
+	return strftime(logbuffer, LOG_BUFF_SIZE, timefmt, &tm);
 }
 
-#define print_pcap_err(hdr) fprintf(stderr, #hdr " %s\n", pcaperr);
+#if defined(DBG1)
+static int strftimenow_ms() {
+	struct timeval tv;
+	if(gettimeofday(&tv, NULL) != 0) {
+		return strftimenow();
+	}
+	struct tm tm;
+	localtime_r(&tv.tv_sec, &tm);
+	int tw = strftime(logbuffer, LOG_BUFF_SIZE, timefmt, &tm);
+	/* moving back to omit ': ' characters in timefmt */
+	tw -= 2;
+	tw += snprintf(logbuffer+tw, LOG_BUFF_SIZE-tw, ".%06ld: ", tv.tv_usec);
+	return tw;
+}
+#endif
+
+static void pkt_logf(const char * _fmt, ...) {
+	va_list args;
+	va_start(args, _fmt);
+	int tw = 0;
+#if defined(DBG1)
+	tw = strftimenow_ms();
+#else
+	tw = strftimenow();
+#endif
+	tw += vsnprintf(logbuffer+tw, LOG_BUFF_SIZE-tw, _fmt, args);
+	write(dfd, logbuffer, tw);
+}
+
+
+
+#else
+
+#define pkt_logf(...)
+#define pkt_log(...)
+
+#endif
+
+#if defined(DBG1)
+
+/* these symbols are used to extra verbose logging */
+#define pkt_logf1 pkt_logf
+#define pkt_log1 pkt_log
+
+#else
+
+#define pkt_logf1(...)
+#define pkt_log1(...)
+
+#endif
+
+#define print_errno(hdr) { 							\
+	pkt_logf(#hdr " %s\n", errno ? strerror(errno) : "unkown error"); 	\
+	fprintf(stderr, #hdr " %s\n", errno ? strerror(errno) : "unkown error"); \
+}
+
+#define print_errno_ret(hdr) { 		\
+	print_errno(hdr);            	\
+	return 1;                       \
+}
+
+#define print_errno_exit(hdr) {     	\
+	print_errno(hdr);                \
+	exit(1);                         \
+}
+
+#define print_pcap_err(hdr) { 			\
+	pkt_logf(#hdr "%s\n", pcaperr);		\
+	fprintf(stderr, #hdr " %s\n", pcaperr); \
+}
+
 // print_pcap_err and return 1
-#define print_pcap_err_ret(hdr) { \
-    print_pcap_err(hdr);            \
-    return 1;                       \
+#define print_pcap_err_ret(hdr) { 	\
+	print_pcap_err(hdr);            \
+	return 1;                       \
 }
 
-#define print_err_ret(err) { \
-    fputs(#err "\n", stderr);   \
-    return 1;              \
-}
-
-// clean terminal
+/* clean terminal */
 #define tclean() printf("\033[H\033[J")
-// dont wrap content on overflow
+/* dont wrap content on overflow */
 #define tsetnowrap() printf("\033[?7l")
-// set cursor position
+/* set cursor position */
 #define tgotoxy(x, y) printf("\033[%d;%dH", x, y)
 
 /* indexes for specified columns within colspec */
@@ -58,101 +138,133 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 #define SIZE_CIX  (CIX_FACT_START+1)
 #define TIME_CIX  (CIX_FACT_START+2)
 
-#define CT_DOUBLE 0
+/* column type (CT_) represents which union field present under 'struct td' will be used to determine cell cstr 
+*/
+
+/* uses .uint64_val and formats output as %d{K/M/G} representing amount of bytes */
+#define CT_SIZE 0
+/* uses .uint64_val does no extra formatting */
 #define CT_UINT64 1
+/* uses .in_addr_val and formats output in IpV4 cidr xxx.xxx.xxx.xxx */
 #define CT_INADDR 2
+/* uses .proto and formats output according to its protocol chain ex. ETH-IP4-UDP */
 #define CT_PKTSUM 3
+/* uses .time and formats output in number of elapsed seconds, minutes since the measurement. 
+   ex. 1h34m2s
+   */
 #define CT_TIME   4
+/* uses .uint16_val, does no extra formatting */
 #define CT_UINT16 5
+/* uses .in6_addr_val, formats output to IPv6 CIDR */
 #define CT_IN6ADDR 6
 
 typedef u_char celltype_t;
 
 struct colspec {
-    char * hdr;
-    uint16_t max_size;
-    uint16_t c_size;
-    celltype_t coltype;
-    u_char visible  : 1;
-    /* if set to 0 will indicate that column value may change, 
-        and cstr must be updated on every display */
-    u_char readonly : 1;
+	/*
+	   this is text which will be displayed as the column header
+	   */
+	char * hdr;
+	/*
+	   maximum allowed size for this column to expand
+	   */
+	uint16_t max_size;
+	/*
+	   current size. must be <= max_size and must be >= (strlen(hdr) + 1)
+	   this value will dynamically expand to match max_size if needed.
+	   note that column will never shrink
+	   */
+	uint16_t c_size;
+	/*
+	   datatype stored in the column
+	   */
+	celltype_t coltype;
+	/*
+	   controls whether column is displayed - determined by grouping options provided by user
+	   */
+	u_char visible  : 1;
+	/* 
+	   if column is marked as read-write (readonly=0) 
+	   then its cstr will be refreshed on every print.
+	   otherwise its only being set on init
+	   */
+	u_char readonly : 1;
 } colspec [] = {
-    /* dims - not visible by default */
-    {
-        .hdr = "SUM",
-        .c_size = 4,
-        /* XXXX-YYYY-ZZZZ\0 */
-        .max_size = MAX_SUMMARY_LEN,
-        .coltype = CT_PKTSUM,
-        .visible = 0,
-        .readonly = 1,
-    },
-    {         
-        .hdr = "IPSADDR",
-        .c_size = 11,
-        /* ipv4/v6 */
-        .max_size = 61,
-        /* by default ipv4 */
-        .coltype = CT_INADDR,
-        .visible = 0,
-        .readonly = 1,
-    },
-    {         
-        .hdr = "IPDADDR",
-        .c_size = 11,
-        /* ipv4/v6 */
-        .max_size = 61,
-        /* by default ipv4 */
-        .coltype = CT_INADDR,
-        .visible = 0,
-        .readonly = 1,
-    },
-    {         
-        .hdr = "SRC",
-        .c_size = 6,
-        /* xxxxx\0 */
-        .max_size = 6,
-        .coltype = CT_UINT16,
-        .visible = 0,
-        .readonly = 1,
-    },
-    {         
-        .hdr = "DST",
-        .c_size = 6,
-        /* xxxxx\0 */
-        .max_size = 6,
-        .coltype = CT_UINT16,
-        .visible = 0,
-        .readonly = 1,
-    },
-    /* facts - visible by default */
-    {
-        .hdr = "COUNT",
-        .c_size = 6,
-        /* XXXXXXXXX\0 */
-        .max_size = 10,
-        .coltype = CT_UINT64,
-        .visible = 1,
-        .readonly = 0,
-    },
-    {
-        .hdr = "SIZE",
-        .c_size = 5,
-        /* XXXXX.XX{B,K,M,...}\0 */
-        .max_size = 10,
-        .coltype = CT_DOUBLE,
-        .visible = 1,
-        .readonly = 0,
-    },
-    {
-        .hdr = "LTIME",
-        .c_size = 6,
-        .max_size = 10,
-        .coltype = CT_TIME,
-        .visible = 1,
-        .readonly = 0
-    }
+	/* dims - not visible by default */
+	{
+		.hdr = "SUM",
+		.c_size = 4,
+		/* XXXX-YYYY-ZZZZ\0 */
+		.max_size = MAX_SUMMARY_LEN,
+		.coltype = CT_PKTSUM,
+		.visible = 0,
+		.readonly = 1,
+	},
+	{         
+		.hdr = "IPSADDR",
+		.c_size = 11,
+		/* ipv4/v6 */
+		.max_size = 61,
+		/* by default ipv4 */
+		.coltype = CT_INADDR,
+		.visible = 0,
+		.readonly = 1,
+	},
+	{         
+		.hdr = "IPDADDR",
+		.c_size = 11,
+		/* ipv4/v6 */
+		.max_size = 61,
+		/* by default ipv4 */
+		.coltype = CT_INADDR,
+		.visible = 0,
+		.readonly = 1,
+	},
+	{         
+		.hdr = "SRC",
+		.c_size = 6,
+		/* xxxxx\0 */
+		.max_size = 6,
+		.coltype = CT_UINT16,
+		.visible = 0,
+		.readonly = 1,
+	},
+	{         
+		.hdr = "DST",
+		.c_size = 6,
+		/* xxxxx\0 */
+		.max_size = 6,
+		.coltype = CT_UINT16,
+		.visible = 0,
+		.readonly = 1,
+	},
+	/* facts - visible by default */
+	{
+		.hdr = "COUNT",
+		.c_size = 6,
+		/* XXXXXXXXX\0 */
+		.max_size = 10,
+		.coltype = CT_UINT64,
+		.visible = 1,
+		.readonly = 0,
+	},
+	{
+		.hdr = "SIZE",
+		.c_size = 5,
+		/* XXXXX.XX{B,K,M,...}\0 */
+		.max_size = 10,
+		.coltype = CT_SIZE,
+		.visible = 1,
+		.readonly = 0,
+	},
+	{
+		.hdr = "LTIME",
+		.c_size = 6,
+		.max_size = 10,
+		.coltype = CT_TIME,
+		.visible = 1,
+		.readonly = 0
+	}
 };
 
 
@@ -168,72 +280,21 @@ struct colspec {
 #define CRDONLY(IX) colspec[IX].readonly
 
 struct {
-    // device, for example:
-    // -d enp68s0
-    // -d ppp0
-    // -d lo
-    char * d;
-    // refresh interval in seconds
-    // -i 2
-    int i;
-    /* raw output only */
-    int r;
+	// device, for example:
+	// -d enp68s0
+	// -d ppp0
+	// -d lo
+	char * d;
+	// refresh interval in seconds
+	// -i 2
+	int i;
+	/* raw output only */
+	int r;
 } opts = {
-    .d = NULL,
-    .i = 1,
-    .r = 0,
+	.d = NULL,
+	.i = 1,
+	.r = 0,
 };
-
-int init_opts(int argc, char * argv[])
-{
-    int o;
-    size_t i = 0;
-
-    while((o = getopt(argc, argv, "d:g:i:")) != -1) {
-        switch(o) {
-        case 'd':
-            opts.d = strdup(optarg);
-            break;
-        case 'g':
-            for(;;) {
-                if(!optarg[i]) break;
-                switch(optarg[i]) {
-                case 's':
-                    CVIS(SUMMARY_CIX) = 1;
-                    break;
-                case 'z':
-                    CVIS(IPSADDR_CIX) = 1;
-                    break;
-                case 'x':
-                    CVIS(IPDADDR_CIX) = 1;
-                    break;
-                case 'c':
-                    CVIS(SRC_CIX) = 1;
-                    break;
-                case 'v':
-                    CVIS(DST_CIX) = 1;
-                    break;
-                default:
-                    fprintf(stderr, "%s: unkown group option -- %c\n", argv[0], optarg[i]);
-                    break;
-                }
-                i++;
-            }
-            break;
-        case 'i':
-            opts.i = atoi(optarg);
-            if(opts.i <= 0) {
-                fprintf(stderr, "%s: invalid option -- 'i' %s\n", argv[0], optarg);
-                exit(1);
-            }
-            break;
-        default:
-            exit(1);
-        }
-    }
-
-    return 0;
-}
 
 
 const char * clr_norm = "\x1B[0m";
@@ -249,182 +310,258 @@ const char * clr_wht = "\x1B[37m";
 #define clr_local clr_mag
 
 struct td {
-    char * cstr;
-    const char * adrstart;
-    const char * adrend;
-    celltype_t celltype;
-    union {
-        uint64_t uint64_val;
-        uint16_t uint16v;
-        struct in6_addr in6_addr_val;
-        struct in_addr in_addr_val;
-        proto_t proto;
-        time_t time;
-    };
+	char * cstr;
+	const char * adrstart;
+	const char * adrend;
+	celltype_t celltype;
+	union {
+		uint64_t uint64_val;
+		uint16_t uint16v;
+		struct in6_addr in6_addr_val;
+		struct in_addr in_addr_val;
+		proto_t proto;
+		time_t time;
+	};
 };
 
 struct rowspec {
-    uint8_t frefresh;
+	uint8_t frefresh;
 };
 
 struct table {
-    /* rows are first, then columns, then table cell */
-    struct td ** data;
-    unsigned short maxrows;
-    unsigned short rows;
-    unsigned short cols;
-    /* be very careful when handling this array.
-        data may be sorted and reordered. In that case rowspec will refer to wrong rows */
-    struct rowspec * rowspec;
+	/* rows are first, then columns, then table cell */
+	struct td ** data;
+	unsigned short maxrows;
+	unsigned short rows;
+	unsigned short cols;
+	/* be very careful when handling this array.
+	   data may be sorted and reordered. In that case rowspec will refer to wrong rows */
+	struct rowspec * rowspec;
 };
 
-struct globals {
-    pcap_t * pcap_handle;
+static struct globals {
+	pcap_t * pcap_handle;
 
-    struct in_addr laddr;
-    u_char wladdr;
+	struct in_addr laddr;
+	u_char wladdr;
 
-    struct in6_addr laddr6;
-    u_char wladdr6;
+	struct in6_addr laddr6;
+	u_char wladdr6;
 
-    int dlt;
-    struct table t;
-    pthread_t rthr;
-    pthread_spinlock_t sync;
+	int dlt;
+	struct table t;
+	pthread_t rthr;
+	pthread_spinlock_t sync;
 } globals = {
-    .pcap_handle = NULL,
-    .wladdr = 0,
-    .dlt = -1,
-    .wladdr6 = 0,
-    .t = {
-        .data = NULL
-    },
-    .rthr = 0,
+	.pcap_handle = NULL,
+	.wladdr = 0,
+	.dlt = -1,
+	.wladdr6 = 0,
+	.t = {
+		.data = NULL
+	},
+	.rthr = 0,
 };
+
+int init_opts(int argc, char * argv[])
+{
+	int o;
+	size_t i = 0;
+	char spec = 0;
+
+	while((o = getopt(argc, argv, "46l:d:g:i:")) != -1) {
+		switch(o) {
+		case 'd':
+			opts.d = strdup(optarg);
+			break;
+		case '4':
+			spec = 4;
+			break;
+		case '6':
+			spec = 6;
+			break;
+		case 'l':
+			switch(spec) {
+			case 6:
+				if(inet_pton(AF_INET6, optarg, &globals.laddr6)) {
+					fprintf(stderr, "%s: invalid option -- 'l' %s", argv[0], optarg);
+					exit(1);
+				}
+				globals.wladdr6 = 1;
+			case 4:
+			default:
+				if(!inet_aton(optarg, &globals.laddr)) {
+					fprintf(stderr, "%s: invalid option -- 'l' %s", argv[0], optarg);
+					exit(1);
+				}
+				globals.wladdr = 1;
+			}
+			break;
+		case 'g':
+			for(;;) {
+				if(!optarg[i]) 
+					break;
+				switch(optarg[i]) {
+				case 's':
+					CVIS(SUMMARY_CIX) = 1;
+					break;
+				case 'z':
+					CVIS(IPSADDR_CIX) = 1;
+					break;
+				case 'x':
+					CVIS(IPDADDR_CIX) = 1;
+					break;
+				case 'c':
+					CVIS(SRC_CIX) = 1;
+					break;
+				case 'v':
+					CVIS(DST_CIX) = 1;
+					break;
+				default:
+					fprintf(stderr, "%s: unkown group option -- %c\n", argv[0], optarg[i]);
+					exit(1);
+				}
+				i++;
+			}
+			break;
+		case 'n':
+			opts.i = atoi(optarg);
+			if(opts.i <= 0) {
+				fprintf(stderr, "%s: invalid option -- 'n' %s\n", argv[0], optarg);
+				exit(1);
+			}
+			break;
+		default:
+			exit(1);
+		}
+	}
+
+	return 0;
+}
 
 
 /* size in bytes to human readable form */
-int snprintf_size(char *buf, int blen, double size) {
-    int i = 0;
-    const char units[] = {'B', 'K', 'M', 'G', 'T', 'P'};
-    while (size > 1024) {
-        if(i == 5) break;
-        size /= 1024;
-        i++;
-    }
-    if(i > 2) i = 2;
-    return snprintf(buf, blen, "%.*lf%c", i, size, units[i]);
+static int snprintf_size(char *buf, int blen, double size) {
+	int i = 0;
+	const char units[] = {'B', 'K', 'M', 'G', 'T', 'P'};
+	while (size > 1024) {
+		if(i == 5) break;
+		size /= 1024;
+		i++;
+	}
+	if(i > 2) i = 2;
+	return snprintf(buf, blen, "%.*lf%c", i, size, units[i]);
 }
 
 #define MIN  60
 #define HR  ((MIN) * 60)
 #define DAY ((HR) * 24)
 
-/* time in secondas to human readable form */
+/* time in seconds to human readable form */
 int snprintf_time(char * buf, int blen, time_t time) {
-    struct {
-        uint32_t noday;     /* max = a lot */
-        uint32_t nohr  :5;  /* max 24 */
-        uint32_t nomin :6; /* max 60 */
-        uint32_t nosec :6; /* max 60 */
-        uint32_t _pad  :15;
-    } x = {0};
-    while(time >= DAY) {
-        time -= DAY;
-        x.noday++;
-    }
-    while(time >= HR) {
-        time -= HR;
-        x.nohr++;
-    }
-    while(time >= MIN) {
-        time -= MIN;
-        x.nomin++;
-    }
-    x.nosec = time;
+	struct {
+		uint32_t noday;     /* max = a lot */
+		uint32_t nohr  :5;  /* max 24 */
+		uint32_t nomin :6; /* max 60 */
+		uint32_t nosec :6; /* max 60 */
+		uint32_t _pad  :15;
+	} x = {0};
+	while(time >= DAY) {
+		time -= DAY;
+		x.noday++;
+	}
+	while(time >= HR) {
+		time -= HR;
+		x.nohr++;
+	}
+	while(time >= MIN) {
+		time -= MIN;
+		x.nomin++;
+	}
+	x.nosec = time;
 
-    int wrote = 0;
-    if(x.noday)
-        wrote += snprintf(buf+wrote, blen-wrote, "%ud", x.noday);
-    if(x.nohr && (blen-wrote > 1))
-        wrote += snprintf(buf+wrote, blen-wrote, "%uh", x.nohr);
-    if(x.nomin && (blen-wrote > 1))
-        wrote += snprintf(buf+wrote, blen-wrote, "%um", x.nomin);
-    if((blen-wrote) > 1)
-        wrote += snprintf(buf+wrote, blen-wrote, "%us", x.nosec);
+	int wrote = 0;
+	if(x.noday)
+		wrote += snprintf(buf+wrote, blen-wrote, "%ud", x.noday);
+	if(x.nohr && (blen-wrote > 1))
+		wrote += snprintf(buf+wrote, blen-wrote, "%uh", x.nohr);
+	if(x.nomin && (blen-wrote > 1))
+		wrote += snprintf(buf+wrote, blen-wrote, "%um", x.nomin);
+	if((blen-wrote) > 1)
+		wrote += snprintf(buf+wrote, blen-wrote, "%us", x.nosec);
 
-    return wrote;
+	return wrote;
 }
 
 double atof_size(char * sizestr) {
-    char d;
-    double sz;
-    if(sscanf(sizestr, "%lf%c", &sz, &d) != 2) {
-        return 0;
-    }
+	char d;
+	double sz;
+	if(sscanf(sizestr, "%lf%c", &sz, &d) != 2) {
+		return 0;
+	}
 
-    switch(d) {
-    case 'P':
-        sz *= 1024;
-    case 'T':
-        sz *= 1024;
-    case 'G':
-        sz *= 1024;
-    case 'M':
-        sz *= 1024;
-    case 'K':
-        sz *= 1024;
-    }
+	switch(d) {
+		case 'P':
+			sz *= 1024;
+		case 'T':
+			sz *= 1024;
+		case 'G':
+			sz *= 1024;
+		case 'M':
+			sz *= 1024;
+		case 'K':
+			sz *= 1024;
+	}
 
-    return sz;
+	return sz;
 }
 
 
 #define in_addr_cmp(a,b) ((a).s_addr != (b).s_addr)
 
 static inline void swaprow(struct td ** tdata, u_int16_t i, u_int16_t j) {
-    if(i == j) 
-        return;
-    struct td * cpy = tdata[i];
-    tdata[i] = tdata[j];
-    tdata[j] = cpy;
+	if(i == j) 
+		return;
+	struct td * cpy = tdata[i];
+	tdata[i] = tdata[j];
+	tdata[j] = cpy;
 }
 
 /* 1 if bigger */
 static inline int trowcmp(struct td ** tdata, u_int16_t i, u_int16_t j) {
-    if(tdata[i][TIME_CIX].time > tdata[j][TIME_CIX].time)
-        return 1;
-    if(tdata[i][TIME_CIX].time < tdata[j][TIME_CIX].time)
-        return 0;
-    if(CVIS(COUNT_CIX))
-        return tdata[i][COUNT_CIX].uint64_val > tdata[j][COUNT_CIX].uint64_val;
-    return 0;
+	if(tdata[i][TIME_CIX].time > tdata[j][TIME_CIX].time)
+		return 1;
+	if(tdata[i][TIME_CIX].time < tdata[j][TIME_CIX].time)
+		return 0;
+	if(CVIS(COUNT_CIX))
+		return tdata[i][COUNT_CIX].uint64_val > tdata[j][COUNT_CIX].uint64_val;
+	return 0;
 }
 
 /* note that this won't sort rowspec. 
-    So make sure to remove any meaningful data from rowspec before calling sort*/
+   So make sure to remove any meaningful data from rowspec before calling sort*/
 void sort(struct table * t) {
-    /* note that first rows in table is header and thus should be excluded from the sort */
-    if(t->rows < 3 || !CVIS(TIME_CIX)) 
-        return;
+	/* note that first rows in table is header and thus should be excluded from the sort */
+	if(t->rows < 3 || !CVIS(TIME_CIX)) 
+		return;
 
-    struct td ** tdata = t->data;
-    int len = t->rows - 1;
+	struct td ** tdata = t->data;
+	int len = t->rows - 1;
 
-    tdata++;
+	tdata++;
 
-    uint16_t i, j;
+	uint16_t i, j;
 
-    for(i = 6; i < len; i++) {
-        if(trowcmp(tdata, i, i-6))
-            swaprow(tdata, i, i-6);
-    }
+	for(i = 6; i < len; i++) {
+		if(trowcmp(tdata, i, i-6))
+			swaprow(tdata, i, i-6);
+	}
 
-    for(i = 1; i < len; i++) {
-        for(j = i; j > 0 && trowcmp(tdata, j, j-1); j--) {
-            swaprow(tdata, j, j-1);
-        }
-    }
+	for(i = 1; i < len; i++) {
+		for(j = i; j > 0 && trowcmp(tdata, j, j-1); j--) {
+			swaprow(tdata, j, j-1);
+		}
+	}
 }
 
 /* determines if specified address is local on the interface and can be pretty printed */
@@ -434,486 +571,562 @@ void sort(struct table * t) {
 
 /* check if digest contains specified proto_id */
 static inline int isproto(struct pkt_digest * dg, proto_t id) {
-    return dg->meta.proto_flags&IDF(id);
+	return dg->meta.proto_flags&IDF(id);
 }
 
 /* 
-    determines if specified packet should be grouped with row
-    cix is column index. this can be either IPSADDR_CIX or IPSADDR_CIX
-    returns 1 if packet matches or if column is not visible, otherwise returns 0 
-*/
+   determines if specified packet should be grouped with row
+   cix is column index. this can be either IPSADDR_CIX or IPSADDR_CIX
+   returns 1 if packet matches or if column is not visible, otherwise returns 0 
+   */
 static inline int groupip(struct pkt_digest * dg, int cix, struct td * row) {
-    if(CVIS(cix)){
-        if(isproto(dg, ID_IPV4)) {
-            if(in_addr_cmp(row[cix].in_addr_val, cix == IPSADDR_CIX ? dg->ipv4.saddr : dg->ipv4.daddr))
-                return 0;
-        } else if(isproto(dg, ID_IPV6)) {
-            if(memcmp(cix == IPSADDR_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr, &row[cix].in6_addr_val, sizeof(struct in6_addr)))
-                return 0;
-        } else if(row[cix].in_addr_val.s_addr != INADDR_TEST_NET_1) {
-            return 0;
-        }
-    }
-    return 1;
+	if(CVIS(cix)){
+		if(isproto(dg, ID_IPV4)) {
+			if(in_addr_cmp(row[cix].in_addr_val, cix == IPSADDR_CIX ? dg->ipv4.saddr : dg->ipv4.daddr))
+				return 0;
+		} else if(isproto(dg, ID_IPV6)) {
+			if(memcmp(cix == IPSADDR_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr, &row[cix].in6_addr_val, sizeof(struct in6_addr)))
+				return 0;
+		} else if(row[cix].in_addr_val.s_addr != INADDR_TEST_NET_1) {
+			return 0;
+		}
+	}
+	return 1;
 }
 
 /*
-    set cell specified by column index (cix) and row to ip value 
-    do nothing if column is not visible
-    cix may be IPSADDR_CIX or IPDADDR_CIX
-*/
+   set cell specified by column index (cix) and row to ip value 
+   do nothing if column is not visible
+   cix may be IPSADDR_CIX or IPDADDR_CIX
+   */
 static inline void setipcell(struct pkt_digest * dg, int cix, struct td * row) {
-    if(!CVIS(cix)) {
-        return;
-    }
+	if(!CVIS(cix)) {
+		return;
+	}
 
-    if(isproto(dg, ID_IPV4)) {
-        struct in_addr a =  cix == IPSADDR_CIX ? dg->ipv4.saddr : dg->ipv4.daddr;
-        row[cix].celltype = 0; /* return type to default - ipv4 */
-        row[cix].in_addr_val = a;
-        if(FORMAT_INADDR(a)) {
-            row[cix].adrstart = clr_local;
-            row[cix].adrend = clr_norm;
-        } else {
-            row[cix].adrstart = NULL;
-            row[cix].adrend = NULL;
-        }
-    } else if(isproto(dg, ID_IPV6)) {
-        struct in6_addr * i6 =  cix == IPSADDR_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr;
-        row[cix].celltype = CT_IN6ADDR; /* override default column typ to ipv6 */
-        row[cix].in6_addr_val = *i6;
-        if(FORMAT_IN6ADDR(i6)) {
-            row[cix].adrstart = clr_local;
-            row[cix].adrend = clr_norm;
-        } else {
-            row[cix].adrstart = NULL;
-            row[cix].adrend = NULL;
-        }
-    } else {
-        row[cix].celltype = 0;
-        row[cix].in_addr_val.s_addr = INADDR_TEST_NET_1;
-        row[cix].adrstart = NULL;
-        row[cix].adrend = NULL;
-    }
+	if(isproto(dg, ID_IPV4)) {
+		struct in_addr a =  cix == IPSADDR_CIX ? dg->ipv4.saddr : dg->ipv4.daddr;
+		row[cix].celltype = 0; /* return type to default - ipv4 */
+		row[cix].in_addr_val = a;
+		if(FORMAT_INADDR(a)) {
+			row[cix].adrstart = clr_local;
+			row[cix].adrend = clr_norm;
+		} else {
+			row[cix].adrstart = NULL;
+			row[cix].adrend = NULL;
+		}
+	} else if(isproto(dg, ID_IPV6)) {
+		struct in6_addr * i6 =  cix == IPSADDR_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr;
+		row[cix].celltype = CT_IN6ADDR; /* override default column typ to ipv6 */
+		row[cix].in6_addr_val = *i6;
+		if(FORMAT_IN6ADDR(i6)) {
+			row[cix].adrstart = clr_local;
+			row[cix].adrend = clr_norm;
+		} else {
+			row[cix].adrstart = NULL;
+			row[cix].adrend = NULL;
+		}
+	} else {
+		row[cix].celltype = 0;
+		row[cix].in_addr_val.s_addr = INADDR_TEST_NET_1;
+		row[cix].adrstart = NULL;
+		row[cix].adrend = NULL;
+	}
 }
 
 /* 
-    determines if specified packet should be grouped with row
-    cix is column index. this can be either SRC_CIX or DST_CIX
-    returns 1 if packet matches or if column is not visible, otherwise returns 0 
-*/
+   determines if specified packet should be grouped with row
+   cix is column index. this can be either SRC_CIX or DST_CIX
+   returns 1 if packet matches or if column is not visible, otherwise returns 0 
+   */
 static inline int group_port(struct pkt_digest * dg, int cix, struct td * row) {
-    if(CVIS(cix)){
-        if(isproto(dg, ID_TCP)) {
-            if((cix == SRC_CIX ? dg->tcp.source : dg->tcp.dest) != row[cix].uint16v) {
-                return 0;
-            }
-        } else if(isproto(dg, ID_UDP)) {
-            if((cix == SRC_CIX ? dg->udp.source : dg->udp.dest) != row[cix].uint16v) {
-                return 0;
-            }
-        } else if(row[cix].uint16v) {
-            return 0;
-        }
-    }
-    return 1;
+	if(CVIS(cix)){
+		if(isproto(dg, ID_TCP)) {
+			if((cix == SRC_CIX ? dg->tcp.source : dg->tcp.dest) != row[cix].uint16v) {
+				return 0;
+			}
+		} else if(isproto(dg, ID_UDP)) {
+			if((cix == SRC_CIX ? dg->udp.source : dg->udp.dest) != row[cix].uint16v) {
+				return 0;
+			}
+		} else if(row[cix].uint16v) {
+			return 0;
+		}
+	}
+	return 1;
 }
 
 /*
-    set cell specified by column index (cix) and row to tcp / udp port value 
-    do nothing if column is not visible
-    cix may be SRC_CIX or DST_CIX
-*/
+   set cell specified by column index (cix) and row to tcp / udp port value 
+   do nothing if column is not visible
+   cix may be SRC_CIX or DST_CIX
+   */
 static inline void setportcell(struct pkt_digest * dg, int cix, struct td * row) {
-    if(!CVIS(cix))
-        return;
+	if(!CVIS(cix))
+		return;
 
-    if(isproto(dg, ID_UDP)) {
-        row[cix].uint16v = (cix == SRC_CIX ? dg->udp.source : dg->udp.dest);
-    } else if(isproto(dg, ID_TCP)) {
-        row[cix].uint16v = (cix == SRC_CIX ? dg->tcp.source : dg->tcp.dest);
-    } else {
-        row[cix].uint16v = 0;
-    }
+	if(isproto(dg, ID_UDP)) {
+		row[cix].uint16v = (cix == SRC_CIX ? dg->udp.source : dg->udp.dest);
+	} else if(isproto(dg, ID_TCP)) {
+		row[cix].uint16v = (cix == SRC_CIX ? dg->tcp.source : dg->tcp.dest);
+	} else {
+		row[cix].uint16v = 0;
+	}
 
-    if(
-        ( isproto(dg, ID_IPV4) && FORMAT_INADDR(cix == SRC_CIX ? dg->ipv4.saddr : dg->ipv4.daddr) ) ||
-        ( isproto(dg, ID_IPV6) && FORMAT_IN6ADDR(cix == SRC_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr))
-    ) {
-        row[cix].adrstart = clr_local;
-        row[cix].adrend = clr_norm;
-    } else {
-        row[cix].adrstart = NULL;
-        row[cix].adrend = NULL;
-    }
+	if(	( isproto(dg, ID_IPV4) && FORMAT_INADDR(cix == SRC_CIX ? dg->ipv4.saddr : dg->ipv4.daddr) ) ||
+		( isproto(dg, ID_IPV6) && FORMAT_IN6ADDR(cix == SRC_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr))
+	  ) {
+		row[cix].adrstart = clr_local;
+		row[cix].adrend = clr_norm;
+	} else {
+		row[cix].adrstart = NULL;
+		row[cix].adrend = NULL;
+	}
 }
 
 void upsert(struct table * t, struct pkt_digest * dg) {
 
-    struct td * row;
-    uint16_t i;
+	struct td * row;
+	uint16_t i;
 
-    if(pthread_spin_lock(&globals.sync)) 
-        print_errno_exit(upsert:)
+	if(pthread_spin_lock(&globals.sync)) 
+		print_errno_exit(upsert:)
 
-    for(i = 1; i < t->rows; i++) {
+	for(i = 1; i < t->rows; i++) {
 
-        row = t->data[i];
+		row = t->data[i];
 
-        if(CVIS(SUMMARY_CIX) && dg->meta.proto_flags != row[SUMMARY_CIX].proto)
-            continue;
-        
-        if(!groupip(dg, IPSADDR_CIX, row))
-            continue;
+		if(CVIS(SUMMARY_CIX) && dg->meta.proto_flags != row[SUMMARY_CIX].proto)
+			continue;
 
-        if(!groupip(dg, IPDADDR_CIX, row))
-            continue;
+		if(!groupip(dg, IPSADDR_CIX, row))
+			continue;
 
-        if(!group_port(dg, SRC_CIX, row))
-            continue;
+		if(!groupip(dg, IPDADDR_CIX, row))
+			continue;
 
-        if(!group_port(dg, DST_CIX, row))
-            continue;
+		if(!group_port(dg, SRC_CIX, row))
+			continue;
+
+		if(!group_port(dg, DST_CIX, row))
+			continue;
 
 
-        /* row is the same => update facts */
+		/* row is the same => update facts */
 
-        if(CVIS(COUNT_CIX)) {
-            row[COUNT_CIX].uint64_val++;
-        }
+		if(CVIS(COUNT_CIX)) {
+			row[COUNT_CIX].uint64_val++;
+		}
 
-        if(CVIS(SIZE_CIX)) {
-            row[SIZE_CIX].uint64_val += dg->meta.total_len;
-        }
+		if(CVIS(SIZE_CIX)) {
+			row[SIZE_CIX].uint64_val += dg->meta.total_len;
+		}
 
-        if(CVIS(TIME_CIX)) {
-            row[TIME_CIX].time = time(NULL);
-        }
+		if(CVIS(TIME_CIX)) {
+			row[TIME_CIX].time = time(NULL);
+		}
 
-        goto UNLOCK_END;
-    }
+		goto UNLOCK_END;
+	}
 
-    if(t->rows >= t->maxrows) {
-        row = t->data[t->rows - 1];
-        t->rowspec[t->rows - 1].frefresh = 1;
-    } else {
-        row = t->data[t->rows];
-        t->rows++;
-    }
+	if(t->rows >= t->maxrows) {
+		row = t->data[t->rows - 1];
+		t->rowspec[t->rows - 1].frefresh = 1;
+	} else {
+		row = t->data[t->rows];
+		t->rows++;
+	}
 
-    setipcell(dg, IPSADDR_CIX, row);
-    setipcell(dg, IPDADDR_CIX, row);
+	setipcell(dg, IPSADDR_CIX, row);
+	setipcell(dg, IPDADDR_CIX, row);
 
-    setportcell(dg, SRC_CIX, row);
-    setportcell(dg, DST_CIX, row);
+	setportcell(dg, SRC_CIX, row);
+	setportcell(dg, DST_CIX, row);
 
-    if(CVIS(COUNT_CIX)) {
-        row[COUNT_CIX].uint64_val = 1;
-    }
+	if(CVIS(COUNT_CIX)) {
+		row[COUNT_CIX].uint64_val = 1;
+	}
 
-    if(CVIS(SIZE_CIX)) {
-        row[SIZE_CIX].uint64_val = dg->meta.total_len;
-    }
+	if(CVIS(SIZE_CIX)) {
+		row[SIZE_CIX].uint64_val = dg->meta.total_len;
+	}
 
-    if(CVIS(SUMMARY_CIX)) {
-        row[SUMMARY_CIX].proto = dg->meta.proto_flags;
-    }
+	if(CVIS(SUMMARY_CIX)) {
+		row[SUMMARY_CIX].proto = dg->meta.proto_flags;
+	}
 
-    if(CVIS(TIME_CIX)) {
-       row[TIME_CIX].time = time(NULL);
-    }
-    
+	if(CVIS(TIME_CIX)) {
+		row[TIME_CIX].time = time(NULL);
+	}
+
 UNLOCK_END:
-    pthread_spin_unlock(&globals.sync);
+	pthread_spin_unlock(&globals.sync);
 }
 
 int get_device_info() {
 
-    pcap_if_t * devs;
-    int ret = 0;
-    if((ret = pcap_findalldevs(&devs, pcaperr))) 
-        print_pcap_err_ret(get_device_info:)
+	pcap_if_t * devs;
+	int ret = 0;
+	if((ret = pcap_findalldevs(&devs, pcaperr))) 
+		print_pcap_err_ret(get_device_info:)
 
-    for(pcap_if_t *d=devs; d!=NULL; d=d->next) {
-        
-        if(opts.d != NULL && strcmp(d->name, opts.d)) {
-            continue;
-        }
+	ret = 0;
 
-        for(pcap_addr_t *a=d->addresses; a!=NULL; a=a->next) {
+	for(pcap_if_t *d=devs; d!=NULL; d=d->next) {
 
-            if(a->addr->sa_family == AF_INET) {
-                globals.laddr.s_addr = ((struct sockaddr_in*)a->addr)->sin_addr.s_addr;
-                globals.wladdr = 1;
-            }
+		if(opts.d != NULL && strcmp(d->name, opts.d)) {
+			continue;
+		}
 
-            if(!opts.d) opts.d = strdup(d->name);
+		for(pcap_addr_t *a=d->addresses; a!=NULL; a=a->next) {
 
-            return 0;
-        }
-    }
+			if(!globals.wladdr && a->addr->sa_family == AF_INET) {
+				globals.laddr.s_addr = ((struct sockaddr_in*)a->addr)->sin_addr.s_addr;
+				globals.wladdr = 1;
+			}
 
-    fprintf(stderr, "get_device_info: couldnt find device\n");
-    return 1;
+			if(!globals.wladdr6 && a->addr->sa_family == AF_INET6) {
+				memcpy( &globals.laddr6, 
+					&((struct sockaddr_in6*)a->addr)->sin6_addr, 
+					sizeof(globals.laddr6));
+				globals.wladdr6 = 1;
+			}
+
+			if(!opts.d) 
+				opts.d = strdup(d->name);
+		}
+
+		return 0;
+	}
+
+	fprintf(stderr, "get_device_info: couldnt find device\n");
+	return 1;
 }
 
 
 /*
-    since pcap will run rcv_pkt in single thread it should be ok to
-    to store info of currently processed packet in global variable.
-*/
+   since pcap will run rcv_pkt in single thread it should be ok to
+   to store info of currently processed packet in global variable.
+   */
 struct pkt_digest pkt_digest;
 
 void rcv_pkt(u_char * const args, const struct pcap_pkthdr * const _h, const u_char * const _p) {
 
-    const u_char * pktptr = _p;
-    bpf_u_int32 pktlen = _h->caplen;
-    pktcallback next = NULL;
+	const u_char * pktptr = _p;
+	bpf_u_int32 pktlen = _h->caplen;
+	pktcallback next = NULL;
 
-    switch(globals.dlt) {
-    case DLT_EN10MB:
-        pkt_digest.meta.nexthop = rcv_dlt_en10mb;
-        break;
-    case DLT_LINUX_SLL:
-        pkt_digest.meta.nexthop = rcv_dlt_linux_sll;
-        break;
-    }
+	switch(globals.dlt) {
+		case DLT_EN10MB:
+			pkt_digest.meta.nexthop = rcv_dlt_en10mb;
+			break;
+		case DLT_LINUX_SLL:
+			pkt_digest.meta.nexthop = rcv_dlt_linux_sll;
+			break;
+	}
 
-    pkt_digest.meta.proto_flags = 0;
-    pkt_digest.meta.total_len = _h->len;
+	pkt_digest.meta.proto_flags = 0;
+	pkt_digest.meta.total_len = _h->len;
 
-    while(pkt_digest.meta.nexthop) {
-        next = pkt_digest.meta.nexthop;
-        pkt_digest.meta.nexthop = NULL;
-        next(&pktptr, &pktlen, &pkt_digest);
-    }
+	while(pkt_digest.meta.nexthop) {
+		next = pkt_digest.meta.nexthop;
+		pkt_digest.meta.nexthop = NULL;
+		next(&pktptr, &pktlen, &pkt_digest);
+	}
 
-    upsert(&globals.t, &pkt_digest);
+	upsert(&globals.t, &pkt_digest);
 }
 
 const char ct[] = "cleanup... ";
 
 void cleanup()
 {
-    write(STDOUT_FILENO, ct, sizeof(ct));
-    if(opts.d) free(opts.d);
-    if(globals.rthr) pthread_cancel(globals.rthr);
-    if(globals.pcap_handle) {
-        pcap_breakloop(globals.pcap_handle);
-        pcap_close(globals.pcap_handle);
-    }
-    pthread_spin_destroy(&globals.sync);
-    if(globals.t.data) {
-        for(size_t i = 0; i < globals.t.maxrows; i++) {
-            for(size_t j = 0; j < globals.t.cols; j++) {
-                if(i > 0)
-                    free(globals.t.data[i][j].cstr);
-            }
-            free(globals.t.data[i]);
-        }
-        free(globals.t.data);
-        free(globals.t.rowspec);
-    }
-    puts("done");
-    exit(0);
+	pkt_log("starting cleanup\n");
+	write(STDOUT_FILENO, ct, sizeof(ct));
+	if(opts.d) free(opts.d);
+	if(globals.rthr) pthread_cancel(globals.rthr);
+	if(globals.pcap_handle) {
+		pcap_breakloop(globals.pcap_handle);
+		pcap_close(globals.pcap_handle);
+	}
+	pthread_spin_destroy(&globals.sync);
+	if(globals.t.data) {
+		for(size_t i = 0; i < globals.t.maxrows; i++) {
+			for(size_t j = 0; j < globals.t.cols; j++) {
+				if(i > 0)
+					free(globals.t.data[i][j].cstr);
+			}
+			free(globals.t.data[i]);
+		}
+		free(globals.t.data);
+		free(globals.t.rowspec);
+	}
+
+	pkt_log("done cleanup\n");
+
+#if defined(DBG)
+	if(dfd > 0) 
+		close(dfd);
+#endif
+
+	puts("done");
+	exit(0);
+}
+
+/*
+ * return number of written bytes	
+ * */
+int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
+	
+	int wrote;
+	celltype_t celltype;
+
+	celltype = t->data[i][j].celltype;
+	if(!celltype) {
+		celltype = CTP(j);
+	}
+
+	switch(celltype) {
+	case CT_PKTSUM:
+		wrote = sprintf_proto(t->data[i][j].cstr, t->data[i][j].proto);
+		break;
+	case CT_SIZE:
+		wrote = snprintf_size(t->data[i][j].cstr, MCSZ(j), (double)t->data[i][j].uint64_val);
+		break;
+	case CT_INADDR:
+
+		if(t->data[i][j].in_addr_val.s_addr == INADDR_TEST_NET_1) {
+			wrote = sprintf(t->data[i][j].cstr, "?");
+		} else {
+			wrote = snprintf(
+				t->data[i][j].cstr, 
+				MCSZ(IPSADDR_CIX), 
+				inet_ntoa(t->data[i][j].in_addr_val));
+		}
+		break;
+		
+	case CT_UINT64:
+		wrote = snprintf(t->data[i][j].cstr, MCSZ(j), "%lu", t->data[i][j].uint64_val);
+		break;
+
+	case CT_UINT16:
+		if(t->data[i][j].uint16v) {
+			wrote = snprintf(t->data[i][j].cstr, MCSZ(j), "%u", t->data[i][j].uint16v);
+		} else {
+			wrote = sprintf(t->data[i][j].cstr, "?");
+		}
+		break;
+		
+	case CT_TIME:
+		if(now < 1 || t->data[i][j].time < 1)
+			wrote = sprintf(t->data[i][j].cstr, "?");
+		else
+			wrote = snprintf_time(t->data[i][j].cstr, MCSZ(j), now - t->data[i][j].time);
+		break;
+	
+	case CT_IN6ADDR:
+		if(inet_ntop(AF_INET6, &t->data[i][j].in6_addr_val, t->data[i][j].cstr, MCSZ(j)))
+			wrote = strlen(t->data[i][j].cstr);
+		else
+			wrote = sprintf(t->data[i][j].cstr, "!(err=%d)", errno);
+		break;
+	default:
+		
+		wrote = sprintf(t->data[i][j].cstr, "?");
+		break;
+	}
+
+	return wrote;
+
 }
 
 void printbl(struct table * t) {
-    int wrote;
-    unsigned short csz;
-    
-    tgotoxy(0, 1);
+	unsigned short csz;
+	int wrote;
 
-    time_t now = time(NULL);
+	tgotoxy(0, 1);
 
-    celltype_t celltype;
+	time_t now = time(NULL);
 
-    for(size_t i = 0; i < t->rows; i++) {
-        for(size_t j = 0; j < t->cols; j++) {
+	for(size_t i = 0; i < t->rows; i++) {
+		for(size_t j = 0; j < t->cols; j++) {
 
-            if(!CVIS(j)) 
-                continue;
+			if(!CVIS(j)) 
+				continue;
 
-            if(t->rowspec[i].frefresh || !t->data[i][j].cstr[0] || (!CRDONLY(j) && i > 0)) {
+			if(t->rowspec[i].frefresh || !t->data[i][j].cstr[0] || (!CRDONLY(j) && i > 0)) {	
+				wrote = write_into_cell_cstr(t, i, j, now) + 1;
+				if(wrote > CCSZ(j))
+					CCSZ(j) = wrote;
+			}
+		}
 
-                celltype = t->data[i][j].celltype;
-                if(!celltype) {
-                    celltype = CTP(j);
-                }
+		if(t->rowspec[i].frefresh)
 
-                switch(celltype) {
-                case CT_PKTSUM:
-                    wrote = sprintf_proto(t->data[i][j].cstr, t->data[i][j].proto);
-                    break;
-                case CT_DOUBLE:
-                    wrote = snprintf_size(
-                        t->data[i][j].cstr, 
-                        MCSZ(j), (double)t->data[i][j].uint64_val);
-                    break;
-                case CT_INADDR:
+			t->rowspec[i].frefresh = 0;
+	}
 
-                    if(t->data[i][j].in_addr_val.s_addr == INADDR_TEST_NET_1) {
-                        wrote = sprintf(t->data[i][j].cstr, "?");
-                    } else {
-                        wrote = snprintf(
-                            t->data[i][j].cstr, 
-                            MCSZ(IPSADDR_CIX), 
-                            inet_ntoa(t->data[i][j].in_addr_val));
-                    }
+	sort(t);
 
-                    break;
-                case CT_UINT64:
-                    wrote = snprintf(
-                        t->data[i][j].cstr, 
-                        MCSZ(j), 
-                        "%lu", t->data[i][j].uint64_val);
+	/*
+	   other loop is needed because certain cells could resize whole column,
+	   so im iterating over all of them first, and then drawing.
+	   */
 
-                    break;
-                case CT_UINT16:
-                    if(t->data[i][j].uint16v) {
-                        wrote = snprintf(
-                            t->data[i][j].cstr, 
-                            MCSZ(j), 
-                            "%u", t->data[i][j].uint16v);
-                    } else {
-                        wrote = sprintf(t->data[i][j].cstr, "?");
-                    }
-                    break;
-                case CT_TIME:
-                    if(now < 1 || t->data[i][j].time < 1)
-                        wrote = sprintf(t->data[i][j].cstr, "?");
-                    else
-                        wrote = snprintf_time(t->data[i][j].cstr, MCSZ(j), now - t->data[i][j].time);
-                    break;
-                case CT_IN6ADDR:
-                    if(inet_ntop(AF_INET6, &t->data[i][j].in6_addr_val, t->data[i][j].cstr, MCSZ(j)))
-                        wrote = strlen(t->data[i][j].cstr);
-                    else
-                        wrote = sprintf(t->data[i][j].cstr, "!(err=%d)", errno);
-                    break;
-                default:
+	for(size_t i = 0; i < t->rows; i++) {
+		for(size_t j = 0; j < t->cols; j++) {
+			if(!CVIS(j)) 
+				continue;
 
-                    wrote = sprintf(t->data[i][j].cstr, "?");
-                    break;
-                }
-
-                wrote++;
-                if(wrote > CCSZ(j))
-                    CCSZ(j) = wrote;
-            }
-        }
-
-        if(t->rowspec[i].frefresh)
-            t->rowspec[i].frefresh = 0;
-    }
-
-    sort(t);
-
-    /*
-        other loop is needed because certain cells could resize whole column,
-        so im iterating over all of them first, and then drawing.
-    */
-
-    for(size_t i = 0; i < t->rows; i++) {
-        for(size_t j = 0; j < t->cols; j++) {
-            if(!CVIS(j)) 
-                continue;
-            csz = CCSZ(j);
-            if(t->data[i][j].adrstart) {
-                printf("%s%*.*s%s", 
-                    t->data[i][j].adrstart, 
-                    csz, csz, 
-                    t->data[i][j].cstr, 
-                    t->data[i][j].adrend);
-            } else {
-                printf("%*.*s", csz, csz, t->data[i][j].cstr);
-            }
-        }
-        puts("");
-    }
+			csz = CCSZ(j);
+			if(t->data[i][j].adrstart) {
+				printf("%s%*.*s%s", 
+						t->data[i][j].adrstart, 
+						csz, csz, 
+						t->data[i][j].cstr, 
+						t->data[i][j].adrend);
+			} else {
+				printf("%*.*s", csz, csz, t->data[i][j].cstr);
+			}
+		}
+		puts("");
+	}
 
 }
 
 void initbl(struct table * t) {
 
-    int maxcap = 20;
-    /* predefined limit + 1 to account for header row */
-    t->maxrows = maxcap + 1;
-    /* 1 because of header row */
-    t->rows = 1;
-    t->cols = sizeof(colspec)/sizeof(struct colspec);
-    
-    t->data = malloc(sizeof(struct td *) * t->maxrows);
-    t->rowspec = calloc(t->maxrows, sizeof(struct rowspec));
-    for(size_t i = 0; i < t->maxrows; i++) {
-        t->data[i] = calloc(t->cols, sizeof(struct td));
-        struct td * row = t->data[i];
 
-        for(size_t j = 0; j < t->cols; j++) {
-            if(!colspec[j].visible) 
-                continue;
-            if(i == 0) {
-                row[j].cstr = colspec[j].hdr;
-            } else {
-                row[j].cstr = malloc(colspec[j].max_size);
-                row[j].cstr[0] = 0;
-            }
-        }
-    }
+	int maxcap = 20;
+	/* predefined limit + 1 to account for header row */
+	t->maxrows = maxcap + 1;
+	/* 1 because of header row */
+	t->rows = 1;
+	t->cols = sizeof(colspec)/sizeof(struct colspec);
+
+	pkt_logf("initbl: %d rows, %d cols\n", t->maxrows, t->cols);
+	
+	t->data = malloc(sizeof(struct td *) * t->maxrows);
+	t->rowspec = calloc(t->maxrows, sizeof(struct rowspec));
+	for(size_t i = 0; i < t->maxrows; i++) {
+		t->data[i] = calloc(t->cols, sizeof(struct td));
+		struct td * row = t->data[i];
+
+		for(size_t j = 0; j < t->cols; j++) {
+			if(!colspec[j].visible) 
+				continue;
+			if(i == 0) {
+				row[j].cstr = colspec[j].hdr;
+			} else {
+				row[j].cstr = malloc(colspec[j].max_size);
+				row[j].cstr[0] = 0;
+			}
+		}
+	}
+#if defined(DBG)
+	for(size_t j = 0; j < t->cols; j++) {
+		if(!colspec[j].visible)
+			continue;
+		pkt_logf("initbl allocated: %d bytes for cells in column %s\n", t->maxrows * colspec[j].max_size, colspec[j].hdr);
+	}
+#endif
+	pkt_logf("initbl allocated: %d bytes for rowspec\n", sizeof(struct rowspec) * t->maxrows);
+	pkt_logf("initbl allocated: %d bytes for %d rows\n", sizeof(struct td *) * t->maxrows, t->maxrows);
+	pkt_logf("initbl allocated: %d bytes for %d cols\n", sizeof(struct td) * t->cols * t->maxrows, t->cols);
 }
 
 void * run_readloop(void * args) {
+	pkt_logf("started readloop\n");
+	for(;;) {
+#if defined(DBG1)
+		clock_t start = clock();
+#endif
+		if(pthread_spin_lock(&globals.sync)) 
+			print_errno_exit(run_readloop:);
+		printbl(&globals.t);
+		pthread_spin_unlock(&globals.sync);
+#if defined(DBG1)
+		clock_t end = clock();		
+		pkt_logf1("printbl done in %.1f μs\n", 1e6 * (float)(end-start) / CLOCKS_PER_SEC);
+#endif		
+		sleep(opts.i);
+	}
+	return NULL;
+}
 
-    for(;;) {
-        if(pthread_spin_lock(&globals.sync)) 
-            print_errno_exit(run_readloop:);
-        printbl(&globals.t);
-        pthread_spin_unlock(&globals.sync);
-        sleep(opts.i);
-    }
-    return NULL;
+void pkt_logf_laddr6() {
+	char buff[60];
+	if(!inet_ntop(AF_INET6, &globals.laddr6, buff, 60)){
+		print_errno_exit(inet_ntop laddr6: );
+	}
+	pkt_logf("laddr6: %s\n", buff);
 }
 
 int main(int argc, char *argv[]) {
 
-    if(init_opts(argc, argv)) return 1;
+	if(init_opts(argc, argv)) 
+		return 1;
 
-    if(get_device_info()) return 1;
+#if defined(DBG)
+	dfd = open("out", O_WRONLY|O_CREAT|O_APPEND, 0644);
+	if(dfd == -1)
+		print_errno_ret(open debug:);
+#endif
+	pkt_log("pkt starting\n");
 
-    if (!(globals.pcap_handle = pcap_create(opts.d, pcaperr)))
-        print_pcap_err_ret(pcap_create:)
+	if(get_device_info()) 
+		return 1;
+	
+	pkt_logf("device: %s\n", opts.d); 
+	pkt_logf("printbl interval: %ds\n", opts.i);
+	if(globals.wladdr)
+		pkt_logf("laddr4: %s\n", inet_ntoa(globals.laddr));
+	if(globals.wladdr6)
+		pkt_logf_laddr6();
 
-    if (pcap_set_snaplen(globals.pcap_handle, 
-        /* im only using linux_sll, and 802.3 headers. ethhdr is bigger */
-        sizeof(struct ethhdr)
-        /* max ipv4, also it is bigger than max ipv6 header size since ipv6 is only 40 octets  */
-        +sizeof(struct iphdr)+40
-        /* also max udp header size */ 
-        +sizeof(struct tcphdr) 
-    )) print_errno_ret(pcap_set_snaplen:)
+	if (!(globals.pcap_handle = pcap_create(opts.d, pcaperr)))
+		print_pcap_err_ret(pcap_create:)
 
-    if(pcap_set_immediate_mode(globals.pcap_handle, 1)) 
-        print_errno_ret(pcap_set_immediate_mode:)   
+	int snaplen = 
+		/* im only using linux_sll, and 802.3 headers. latter is bigger */
+		sizeof(struct ethhdr)
+		+ sizeof(struct pppoe_hdr)
+		/* max ipv4, ipv6  */
+		+ sizeof(struct iphdr)+40
+		/* also max udp header size */ 
+		+ sizeof(struct tcphdr);
 
-    if(pcap_activate(globals.pcap_handle)) print_errno_ret(pcap_activate:)
+	pkt_logf("snaplen: %d\n", snaplen);
 
-    globals.dlt = pcap_datalink(globals.pcap_handle);
+	if (pcap_set_snaplen(globals.pcap_handle, snaplen)) 
+		print_errno_ret(pcap_set_snaplen:)
 
-    tclean();
-    tsetnowrap();
-    tgotoxy(0,0);
+	if(pcap_set_immediate_mode(globals.pcap_handle, 1)) 
+		print_errno_ret(pcap_set_immediate_mode:)   
 
-    //Printf("listening on %s\n", opts.d);
-    signal(SIGINT, cleanup);
+	if(pcap_activate(globals.pcap_handle)) 
+		print_errno_ret(pcap_activate:)
 
+	globals.dlt = pcap_datalink(globals.pcap_handle);
 
-    initbl(&globals.t);
+	tclean();
+	tsetnowrap();
+	tgotoxy(0,0);
 
-    pthread_spin_init(&globals.sync, 0);
-    if(pthread_create(&globals.rthr, NULL, run_readloop, NULL)) print_errno_ret(pthread_create:)
+	signal(SIGINT, cleanup);
 
-    if(pcap_loop(globals.pcap_handle, -1, rcv_pkt, NULL)) print_errno_ret(pcap_loop:)
+	initbl(&globals.t);
 
-    cleanup();
-    return 0;
+	pthread_spin_init(&globals.sync, 0);
+	
+	if(pthread_create(&globals.rthr, NULL, run_readloop, NULL)) 
+		print_errno_ret(pthread_create:)
+	
+	pkt_logf("starting pcap_loop\n");
+
+	if(pcap_loop(globals.pcap_handle, -1, rcv_pkt, NULL)) 
+		print_errno_ret(pcap_loop:)
+
+	cleanup();
+	return 0;
 }
