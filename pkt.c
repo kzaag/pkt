@@ -11,6 +11,7 @@
 #include <linux/if_pppox.h>
 #include <stdarg.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 
 #include "pkt_digest.h"
 
@@ -154,7 +155,7 @@ static void pkt_logf(const char * _fmt, ...) {
    */
 #define CT_TIME   4
 /* uses .uint16_val, does no extra formatting */
-#define CT_UINT16 5
+#define CT_PORT 5
 /* uses .in6_addr_val, formats output to IPv6 CIDR */
 #define CT_IN6ADDR 6
 
@@ -225,7 +226,7 @@ struct colspec {
 		.c_size = 6,
 		/* xxxxx\0 */
 		.max_size = 6,
-		.coltype = CT_UINT16,
+		.coltype = CT_PORT,
 		.visible = 0,
 		.readonly = 1,
 	},
@@ -234,7 +235,7 @@ struct colspec {
 		.c_size = 6,
 		/* xxxxx\0 */
 		.max_size = 6,
-		.coltype = CT_UINT16,
+		.coltype = CT_PORT,
 		.visible = 0,
 		.readonly = 1,
 	},
@@ -290,10 +291,15 @@ struct {
 	int i;
 	/* raw output only */
 	int r;
+	
+	/* try to obtain process info */
+	int p;
+
 } opts = {
 	.d = NULL,
 	.i = 1,
 	.r = 0,
+	.p = 0
 };
 
 
@@ -352,6 +358,7 @@ static struct globals {
 	struct table t;
 	pthread_t rthr;
 	pthread_spinlock_t sync;
+
 } globals = {
 	.pcap_handle = NULL,
 	.wladdr = 0,
@@ -867,7 +874,7 @@ void cleanup()
 #if defined(DBG)
 	if(dfd > 0) 
 		close(dfd);
-#endif
+#endif 
 
 	puts("done");
 	exit(0);
@@ -909,7 +916,7 @@ int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 		wrote = snprintf(t->data[i][j].cstr, MCSZ(j), "%lu", t->data[i][j].uint64_val);
 		break;
 
-	case CT_UINT16:
+	case CT_PORT:
 		if(t->data[i][j].uint16v) {
 			wrote = snprintf(t->data[i][j].cstr, MCSZ(j), "%u", t->data[i][j].uint16v);
 		} else {
@@ -1035,7 +1042,111 @@ void initbl(struct table * t) {
 	pkt_logf("initbl allocated: %d bytes for %d cols\n", sizeof(struct td) * t->cols * t->maxrows, t->cols);
 }
 
+#define INIT_PI_LEN 10
+
+static struct process_info {
+	uint16_t lport;
+	char * desc;
+} * pi = NULL;
+
+void expand_pi(struct process_info ** pi, int * len) {
+	if(!(*pi = realloc(*pi, sizeof(**pi) * *len)))
+		print_errno_exit(expand_pi realloc:)
+}
+
+void get_process_info(struct process_info ** buf, int * len) {
+	if(*buf == NULL || *len == 0) {
+		*len = INIT_PI_LEN;
+		expand_pi(buf, len);	
+	}
+
+	pid_t pid;
+	int status;
+	int pipefd[2];
+
+	if(pipe(pipefd)) {
+		pkt_logf("%s: pipe: %s\n", __func__, strerror(errno));
+		goto ERR;
+	}
+
+	if((pid = fork()) == 0) {
+		/* replace stdout, stderr, and close pipe - not needed any more  */
+		dup2(pipefd[1], STDOUT_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		close(pipefd[1]);
+		close(pipefd[0]);
+
+		const char * paths[] = {
+			"/bin/ss",
+			"/usr/bin/ss",
+			"/usr/sbin/ss",
+			"/sbin/ss"
+		};
+
+		for(int i = 0; i < sizeof(paths); i++) {
+			/* 
+			 * -t = tcp
+			 * -u = udp
+			 * -p = show process
+			 * -H = suppress header
+			 * */
+			execl(paths[i], "ss", "-tpuH", NULL);
+		}	
+
+		/* if we are here then all of the execl must have failed */
+		char * e = strerror(errno);
+		write(STDOUT_FILENO, e, strlen(e));
+			
+		_exit(1);
+	}
+
+	if(pid == -1) {	
+		pkt_logf("%s: fork: %s\n", __func__, strerror(errno));
+		goto ERR;
+	}
+
+	close(pipefd[1]);
+	if(waitpid(pid, &status, 0) == -1) {
+		pkt_logf("%s: waitpid: %s\n", __func__, strerror(errno));
+		goto ERR;
+	}
+
+	char x[1024];
+	int r = read(pipefd[0], x, sizeof(x) - 1);
+	x[r] = 0;
+
+	if(!WIFEXITED(status) || WEXITSTATUS(status)) {
+		pkt_logf("%s: call to ss failed '%s'\n", __func__, x);
+		goto ERR;
+	}	
+
+	char proto[8];
+	char n[16];
+	char saddr[56];
+	char daddr[56];
+	char pd[160];
+
+	if(sscanf(x, "%3s %15s %15s %15s %55s %55s %159s\n", proto, n, n, n, saddr, daddr, pd) != 7) {
+		pkt_logf("%s: scanf: unrecognized format\n");
+		goto ERR;
+	}
+
+
+	pkt_logf("%s=%s=%s=%s\n", proto, saddr, daddr, pd);
+
+	return;
+ERR:
+	pkt_logf("won't try to %s any more\n", __func__);
+	*len = 0;
+	opts.p = 0;
+}
+
+
 void * run_readloop(void * args) {
+	int l =0;
+	get_process_info(&pi, &l);
+	exit(1);
+
 	pkt_logf("started readloop\n");
 	for(;;) {
 #if defined(DBG1)
