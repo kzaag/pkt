@@ -26,6 +26,7 @@ static const char timefmt[] = "%Y-%m-%d %H:%M:%S: ";
 
 #define pkt_log(cstr) pkt_logf(cstr); 
 
+/* at least 24 characters */
 #define LOG_BUFF_SIZE 1024
 
 static __thread char logbuffer[LOG_BUFF_SIZE];
@@ -65,6 +66,16 @@ static void pkt_logf(const char * _fmt, ...) {
 	tw = strftimenow();
 #endif
 	tw += vsnprintf(logbuffer+tw, LOG_BUFF_SIZE-tw, _fmt, args);
+	/*
+	 * on overflow vsnprintf wont return actual amount of written characters,
+	 * instead it will return length of the full array. (also it won't null terminate string)
+	 * and people wonder why BOs still happen. It's not scanf, it's inconsitencies like this.
+	 * */
+	if(tw > LOG_BUFF_SIZE) {
+		tw = LOG_BUFF_SIZE;
+		/* on overflow terminate text in new line */
+		logbuffer[tw-1] = '\n';
+	}
 	write(dfd, logbuffer, tw);
 }
 
@@ -344,6 +355,13 @@ struct table {
 	struct rowspec * rowspec;
 };
 
+#define INIT_PI_LEN 10
+
+struct process_info {
+	uint16_t lport;
+	char * desc;
+};
+
 static struct globals {
 	pcap_t * pcap_handle;
 
@@ -358,6 +376,8 @@ static struct globals {
 	pthread_t rthr;
 	pthread_spinlock_t sync;
 
+	struct process_info * proc_infos;
+	int proc_infos_len;
 } globals = {
 	.pcap_handle = NULL,
 	.wladdr = 0,
@@ -367,6 +387,9 @@ static struct globals {
 		.data = NULL
 	},
 	.rthr = 0,
+
+	.proc_infos = NULL,
+	.proc_infos_len = 0
 };
 
 int init_opts(int argc, char * argv[])
@@ -1041,19 +1064,149 @@ void initbl(struct table * t) {
 	pkt_logf("initbl allocated: %d bytes for %d cols\n", sizeof(struct td) * t->cols * t->maxrows, t->cols);
 }
 
-#define INIT_PI_LEN 10
-
-static struct process_info {
-	uint16_t lport;
-	char * desc;
-} * pi = NULL;
-
 void expand_pi(struct process_info ** pi, int * len) {
 	if(!(*pi = realloc(*pi, sizeof(**pi) * *len)))
 		print_errno_exit(expand_pi realloc:)
 }
 
+#define SS_MAX_PD 80
+struct ss_line_info {
+	proto_t proto;
+	union {
+		struct in_addr laddr;
+		struct in6_addr laddr6;
+	};
+	union {
+		struct in_addr paddr;
+		struct in6_addr paddr6;
+	};
+	uint16_t lport;
+	uint16_t pport;
+	char process_desc[SS_MAX_PD];
+};
+
+static inline int is_white_char(char c) {
+	switch(c) {
+	case '\n':
+		return 1;
+	case '\t':
+		return 1;
+	case ' ': 
+		return 1;
+	}
+	return 0;
+}
+
+char * skip_white_chars(char * buf, int r) {
+	if(!buf || !*buf)
+		return NULL;
+	while(*buf) {
+		if(is_white_char(*buf)) {
+			if(r)
+				return buf;
+			else
+				buf++;
+		} else {
+			if(r)
+				buf++;
+			else
+				return buf;
+		}
+	}
+	return NULL;
+}
+
+static char inet_atonp_buf[24];
+
+/* 
+ * this is not thread safe
+ * parse ip and port in s of len l to in_addr and port 
+ * return 0 on success, 1 on failed parse
+ * */
+static int inet_atonp(const char * const s, int l, struct in_addr * a, uint16_t * p) {
+	char * x = memchr(s, ':', l);
+	if(!x)
+		return 1;
+	if(x-s > sizeof(inet_atonp_buf) -1)
+		return 0;
+	memcpy(inet_atonp_buf, s, x-s);
+	inet_atonp_buf[x-s] = 0;
+	if(inet_aton(inet_atonp_buf, a) != 1)
+		return 0;
+	x++;
+	if(x-(s+l) > 5)
+		return 0;
+	memcpy(inet_atonp_buf, x, x-(s+l));
+	inet_atonp_buf[x-(s+l)] = 0;
+	int _p = atoi(inet_atonp_buf);
+	if(_p <= 0)
+		return 0;
+	*p = (uint16_t)_p;
+	return 1;
+}
+
+/*
+ *	return start of new line,
+ *	...
+ * */
+static char * parse_ss_line(char * buf, int blen, struct ss_line_info * i) {
+	char * s;
+	int mode = 0;
+	while(*buf) {
+		if(is_white_char(*buf)) {
+			buf = skip_white_chars(buf, 0);
+			if(!buf)
+				return NULL;
+		}
+		s = buf;
+		/* 1 means that we skip TO white char */
+		buf = skip_white_chars(buf, 1);
+		if(!buf)
+			return NULL;
+
+		switch(mode) {
+			/* Netid*/
+			case 0:
+				if((buf - s) != 3)
+					return NULL;
+				if(!memcmp(buf, "tcp", 3)) {
+					i->proto |= IDF(ID_TCP);
+				} else if(!memcmp(buf, "udp", 3)) {
+					i->proto |= IDF(ID_UDP);	
+				} else {
+					return NULL;
+				}
+				mode++;
+				break;		
+			/* State */
+			case 1:
+				mode++;
+			/* recv-q */
+			case 2:
+				mode++;
+			/* send-q */
+			case 3:
+				mode++;
+			/* laddr:port */
+			case 4:	
+				if(inet_atonp(s, buf-s, &i->laddr, &i->lport))
+					return NULL;
+				mode++;
+			/* paddr:port */
+			case 5:
+				if(inet_atonp(s, buf-s, &i->paddr, &i->pport))
+					return NULL;
+				mode++;
+			/* psum */
+			case 6:
+				memcpy(i->sss, )
+				break;
+		}
+	}		
+}
+
 void get_process_info(struct process_info ** buf, int * len) {
+	
 	if(*buf == NULL || *len == 0) {
 		*len = INIT_PI_LEN;
 		expand_pi(buf, len);	
@@ -1088,8 +1241,9 @@ void get_process_info(struct process_info ** buf, int * len) {
 			 * -u = udp
 			 * -p = show process
 			 * -H = suppress header
+			 * -O = one line
 			 * */
-			execl(paths[i], "ss", "-tpuH", NULL);
+			execl(paths[i], "ss", "-tpuHO", NULL);
 		}	
 
 		/* if we are here then all of the execl must have failed */
@@ -1110,28 +1264,55 @@ void get_process_info(struct process_info ** buf, int * len) {
 		goto ERR;
 	}
 
-	char x[1024];
-	int r = read(pipefd[0], x, sizeof(x) - 1);
-	x[r] = 0;
+	static char proto[8];
+	static char n[16];
+	static char saddr[56];
+	static char daddr[56];
+	static char pd[160];
+	static char pistr[512];
+	char * pistr_ptr = pistr;
+	int pistr_len = -1;
+	int pistr_offset = 0;
+	int nonce = 0;
 
-	if(!WIFEXITED(status) || WEXITSTATUS(status)) {
-		pkt_logf("%s: call to ss failed '%s'\n", __func__, x);
-		goto ERR;
-	}	
+	for(;;) {
+		pistr_len = read(pipefd[0], pistr+pistr_offset, sizeof(pistr) - 1 - pistr_offset);
+		if(pistr_len <= 0)
+			break;
+		pkt_logf("%d, %d\n", pistr_len, pistr_offset);
+		pistr_len += pistr_offset;
+		pistr[pistr_len] = 0;
+		pistr_ptr = pistr;
+	
+		pkt_logf("%s\n", pistr_ptr);	
 
-	char proto[8];
-	char n[16];
-	char saddr[56];
-	char daddr[56];
-	char pd[160];
+		if(!nonce && (!WIFEXITED(status) || WEXITSTATUS(status))) {
+			pkt_logf("%s: call to ss failed '%s'\n", __func__, pistr);
+			goto ERR;
+		}
+		if(!nonce)
+			nonce = 1;
+		
+		for(;;) {
+			if(sscanf(pistr_ptr, "%3s %15s %15s %15s %55s %55s %159s \n", 
+					proto, n, n, n, saddr, daddr, pd) != 7) {
+				/* we still may have other end of the line waiting in the kernel buffer */
+				pistr_offset = strlen(pistr_ptr);
+				memcpy(pistr, pistr_ptr, pistr_offset);
+				break;
+			}
 
-	if(sscanf(x, "%3s %15s %15s %15s %55s %55s %159s\n", proto, n, n, n, saddr, daddr, pd) != 7) {
-		pkt_logf("%s: scanf: unrecognized format\n");
-		goto ERR;
+			pkt_logf("%s %s %s %s\n", proto, saddr, daddr, pd);
+			pistr_ptr = strchr(pistr_ptr, '\n');
+
+			if(!pistr_ptr) {
+				pistr_offset = 0;
+				break;
+			}
+			pistr_ptr++;	
+		}
+
 	}
-
-
-	pkt_logf("%s=%s=%s=%s\n", proto, saddr, daddr, pd);
 
 	return;
 ERR:
@@ -1142,8 +1323,7 @@ ERR:
 
 
 void * run_readloop(void * args) {
-	int l =0;
-	get_process_info(&pi, &l);
+	get_process_info(&globals.proc_infos, &globals.proc_infos_len);
 	exit(1);
 
 	pkt_logf("started readloop\n");
