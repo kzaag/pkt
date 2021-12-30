@@ -15,7 +15,6 @@
 
 #include "pkt_digest.h"
 
-/* buffer for pcap error string */
 static char pcaperr[PCAP_ERRBUF_SIZE];
 
 #if defined(DBG)
