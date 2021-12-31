@@ -1028,7 +1028,7 @@ static struct sockstat_info * ssht_lookup(struct sockstat_info * req) {
 	uint64_t init_hash = hash;
 	struct sockstat_info * i;
 	
-	pkt_logf("ssht_lookup l:%u:%d p:%u:%d proto=%d  hash=%lu \n", 
+	pkt_logf1("ssht_lookup l:%u:%d p:%u:%d proto=%d  hash=%lu \n", 
 			req->lsaddr.sin_addr.s_addr, req->lsaddr.sin_port,
                         req->psaddr.sin_addr.s_addr, req->psaddr.sin_port,
 			req->proto, req->_hash);
@@ -1576,6 +1576,8 @@ void set_ssht(struct sockstat_info ** ssht, int ssht_len) {
 
 	}
 
+#if defined(DBG1)
+
 	static char sip[96];
 	static char dip[96];
 
@@ -1609,6 +1611,7 @@ void set_ssht(struct sockstat_info ** ssht, int ssht_len) {
 			exit(1);
 		}
 	}
+#endif
 
 	return;
 ERR:
