@@ -12,6 +12,7 @@
 #include <stdarg.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <netinet/in.h>
 
 #include "pkt_digest.h"
 
@@ -22,7 +23,6 @@ static char pcaperr[PCAP_ERRBUF_SIZE];
 static int dfd = 0;
 
 static const char timefmt[] = "%Y-%m-%d %H:%M:%S: ";
-
 
 #define pkt_log(cstr) pkt_logf(cstr); 
 
@@ -134,6 +134,22 @@ static void pkt_logf(const char * _fmt, ...) {
 /* set cursor position */
 #define tgotoxy(x, y) printf("\033[%d;%dH", x, y)
 
+#define SS_PINFO_SZ 40
+struct sockstat_info {
+	proto_t proto;
+	union {
+		struct sockaddr_in lsaddr;
+		struct sockaddr_in6 lsaddr6;
+	};
+	union {
+		struct sockaddr_in psaddr;
+		struct sockaddr_in6 psaddr6;
+	};
+	char pinfo[SS_PINFO_SZ];
+	uint64_t _hash;
+};
+
+
 /* indexes for specified columns within colspec */
 #define SUMMARY_CIX   0
 /* IPv4/v6 address pair */
@@ -148,6 +164,7 @@ static void pkt_logf(const char * _fmt, ...) {
 #define COUNT_CIX CIX_FACT_START
 #define SIZE_CIX  (CIX_FACT_START+1)
 #define TIME_CIX  (CIX_FACT_START+2)
+#define PINFO_CIX (CIX_FACT_START+3)
 
 /* column type (CT_) represents which union field present under 'struct td' will be used to determine cell cstr 
 */
@@ -168,6 +185,9 @@ static void pkt_logf(const char * _fmt, ...) {
 #define CT_PORT 5
 /* uses .in6_addr_val, formats output to IPv6 CIDR */
 #define CT_IN6ADDR 6
+
+/* no backing field, stored process info */
+#define CT_PINFO 7
 
 typedef u_char celltype_t;
 
@@ -275,6 +295,14 @@ struct colspec {
 		.coltype = CT_TIME,
 		.visible = 1,
 		.readonly = 0
+	}, 
+	{
+		.hdr = "PINFO",
+		.c_size = 6,
+		.max_size = SS_PINFO_SZ,
+	 	.coltype = CT_PINFO,
+       		.visible = 0,
+	 	.readonly = 0	
 	}
 };
 
@@ -340,6 +368,9 @@ struct td {
 	};
 };
 
+/* cell type */
+#define TDTP(row, cix) row[cix].celltype ? row[cix].celltype : CTP(cix) 
+
 struct rowspec {
 	uint8_t frefresh;
 };
@@ -353,13 +384,6 @@ struct table {
 	/* be very careful when handling this array.
 	   data may be sorted and reordered. In that case rowspec will refer to wrong rows */
 	struct rowspec * rowspec;
-};
-
-#define INIT_PI_LEN 10
-
-struct process_info {
-	uint16_t lport;
-	char * desc;
 };
 
 static struct globals {
@@ -376,8 +400,8 @@ static struct globals {
 	pthread_t rthr;
 	pthread_spinlock_t sync;
 
-	struct process_info * proc_infos;
-	int proc_infos_len;
+	struct sockstat_info ** ssht;
+	int ssht_len;
 } globals = {
 	.pcap_handle = NULL,
 	.wladdr = 0,
@@ -388,8 +412,8 @@ static struct globals {
 	},
 	.rthr = 0,
 
-	.proc_infos = NULL,
-	.proc_infos_len = 0
+	.ssht = NULL,
+	.ssht_len = 0
 };
 
 int init_opts(int argc, char * argv[])
@@ -398,7 +422,7 @@ int init_opts(int argc, char * argv[])
 	size_t i = 0;
 	char spec = 0;
 
-	while((o = getopt(argc, argv, "46l:d:g:i:")) != -1) {
+	while((o = getopt(argc, argv, "p46l:d:g:n:")) != -1) {
 		switch(o) {
 		case 'd':
 			opts.d = strdup(optarg);
@@ -459,6 +483,10 @@ int init_opts(int argc, char * argv[])
 				fprintf(stderr, "%s: invalid option -- 'n' %s\n", argv[0], optarg);
 				exit(1);
 			}
+			break;
+		case 'p':
+			opts.p = 1;
+			CVIS(PINFO_CIX) = 1;
 			break;
 		default:
 			exit(1);
@@ -593,10 +621,13 @@ void sort(struct table * t) {
 	}
 }
 
+#define IS_LADDR(a) (globals.wladdr && !in_addr_cmp((a), globals.laddr))
+#define IS_LADDR6(a) (globals.wladdr6 && !memcmp((a), &globals.laddr6, sizeof(struct in6_addr)))
+
 /* determines if specified address is local on the interface and can be pretty printed */
-#define FORMAT_INADDR(a) (!opts.r && globals.wladdr && !in_addr_cmp((a), globals.laddr))
+#define FORMAT_INADDR(a) (!opts.r && IS_LADDR(a))
 /* same as FORMAT_INADDR but for ipv6, a must be pointer to in6_addr */
-#define FORMAT_IN6ADDR(a) (!opts.r && globals.wladdr6 && !memcmp((a), &globals.laddr6, sizeof(struct in6_addr))) 
+#define FORMAT_IN6ADDR(a) (!opts.r && IS_LADDR6(a)) 
 
 /* check if digest contains specified proto_id */
 static inline int isproto(struct pkt_digest * dg, proto_t id) {
@@ -611,10 +642,12 @@ static inline int isproto(struct pkt_digest * dg, proto_t id) {
 static inline int groupip(struct pkt_digest * dg, int cix, struct td * row) {
 	if(CVIS(cix)){
 		if(isproto(dg, ID_IPV4)) {
-			if(in_addr_cmp(row[cix].in_addr_val, cix == IPSADDR_CIX ? dg->ipv4.saddr : dg->ipv4.daddr))
+			if(in_addr_cmp(row[cix].in_addr_val, 
+					cix == IPSADDR_CIX ? dg->ipv4.saddr : dg->ipv4.daddr))
 				return 0;
 		} else if(isproto(dg, ID_IPV6)) {
-			if(memcmp(cix == IPSADDR_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr, &row[cix].in6_addr_val, sizeof(struct in6_addr)))
+			if(memcmp(cix == IPSADDR_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr, 
+						&row[cix].in6_addr_val, sizeof(struct in6_addr)))
 				return 0;
 		} else if(row[cix].in_addr_val.s_addr != INADDR_TEST_NET_1) {
 			return 0;
@@ -688,6 +721,7 @@ static inline int group_port(struct pkt_digest * dg, int cix, struct td * row) {
 /*
    set cell specified by column index (cix) and row to tcp / udp port value 
    do nothing if column is not visible
+
    cix may be SRC_CIX or DST_CIX
    */
 static inline void setportcell(struct pkt_digest * dg, int cix, struct td * row) {
@@ -751,6 +785,7 @@ void upsert(struct table * t, struct pkt_digest * dg) {
 			row[SIZE_CIX].uint64_val += dg->meta.total_len;
 		}
 
+
 		if(CVIS(TIME_CIX)) {
 			row[TIME_CIX].time = time(NULL);
 		}
@@ -782,6 +817,7 @@ void upsert(struct table * t, struct pkt_digest * dg) {
 
 	if(CVIS(SUMMARY_CIX)) {
 		row[SUMMARY_CIX].proto = dg->meta.proto_flags;
+
 	}
 
 	if(CVIS(TIME_CIX)) {
@@ -790,6 +826,7 @@ void upsert(struct table * t, struct pkt_digest * dg) {
 
 UNLOCK_END:
 	pthread_spin_unlock(&globals.sync);
+
 }
 
 int get_device_info() {
@@ -832,15 +869,12 @@ int get_device_info() {
 	return 1;
 }
 
-
-/*
-   since pcap will run rcv_pkt in single thread it should be ok to
-   to store info of currently processed packet in global variable.
-   */
-struct pkt_digest pkt_digest;
-
 void rcv_pkt(u_char * const args, const struct pcap_pkthdr * const _h, const u_char * const _p) {
 
+	/* since pcap will run rcv_pkt in single thread it should be ok to
+	 * to store info of currently processed packet in global variable. */
+	static struct pkt_digest pkt_digest;
+	
 	const u_char * pktptr = _p;
 	bpf_u_int32 pktlen = _h->caplen;
 	pktcallback next = NULL;
@@ -866,10 +900,10 @@ void rcv_pkt(u_char * const args, const struct pcap_pkthdr * const _h, const u_c
 	upsert(&globals.t, &pkt_digest);
 }
 
-const char ct[] = "cleanup... ";
 
 void cleanup()
 {
+	const char ct[] = "cleanup... ";
 	pkt_log("starting cleanup\n");
 	write(STDOUT_FILENO, ct, sizeof(ct));
 	if(opts.d) free(opts.d);
@@ -890,6 +924,10 @@ void cleanup()
 		free(globals.t.data);
 		free(globals.t.rowspec);
 	}
+	if(globals.ssht) {
+		for(size_t i = 0; i < globals.ssht_len; i++)
+			free(globals.ssht[i]);
+	}
 
 	pkt_log("done cleanup\n");
 
@@ -902,11 +940,136 @@ void cleanup()
 	exit(0);
 }
 
+int is_laddr_any(struct td * row, int cix) {
+	switch(TDTP(row, cix)) {
+	case CT_INADDR:
+		return IS_LADDR(row[cix].in_addr_val);
+	case CT_IN6ADDR:
+		return IS_LADDR6(&row[cix].in6_addr_val);
+	}
+	return 0;
+}
+
+int saddr_from_td(struct td * row, int cix, int pix, 
+		struct sockaddr_in * saddr, struct sockaddr_in6 * saddr6) {
+	if(!CVIS(pix))
+		return 0;
+	switch(TDTP(row, cix)) {
+	case CT_INADDR:
+		saddr->sin_family = AF_INET;
+		saddr->sin_addr.s_addr = row[cix].in_addr_val.s_addr;	
+		saddr->sin_port = row[pix].uint16v;
+		return 1;
+	case CT_IN6ADDR:
+		saddr6->sin6_family = AF_INET6;
+		saddr6->sin6_addr = row[cix].in6_addr_val;
+		saddr6->sin6_port = row[pix].uint16v;
+		return 1;
+	}
+
+	return 0;
+}
+
+/* return 1 if ok,
+ * 0 otherwise
+ * */
+int set_ss_sadr_from_row(struct td * row, struct sockstat_info * buf) {
+	if(is_laddr_any(row, IPSADDR_CIX)) {
+		if(!saddr_from_td(row, IPSADDR_CIX, SRC_CIX, &buf->lsaddr, &buf->lsaddr6))
+			return 0;
+		if(!saddr_from_td(row, IPDADDR_CIX, DST_CIX, &buf->psaddr, &buf->psaddr6))
+			return 0;
+		return 1;
+	} else if(is_laddr_any(row, IPDADDR_CIX)) {
+		if(!saddr_from_td(row, IPDADDR_CIX, DST_CIX, &buf->lsaddr, &buf->lsaddr6))
+			return 0;
+		if(!saddr_from_td(row, IPSADDR_CIX, SRC_CIX, &buf->psaddr, &buf->psaddr6))
+			return 0;
+		return 1;
+	}
+	return 0;
+}	
+
+static inline void fnv1a_step(uint64_t * h, const unsigned char * d, int dl) {
+	while(dl--) {
+		*h ^= (uint64_t)*d;
+		d++;
+		*h *= 0x100000001b3;
+	}
+}
+
+/* return 0 on failure */
+uint64_t sshf(struct sockstat_info * ss) {
+	uint64_t hash = 0xcbf29ce484222325;
+	if(ss->proto&IDF(ID_IPV6)) {
+		fnv1a_step(&hash, (unsigned char *)&ss->lsaddr6.sin6_addr, sizeof(ss->lsaddr6.sin6_addr));
+		fnv1a_step(&hash, (unsigned char *)&ss->lsaddr6.sin6_port, sizeof(ss->lsaddr6.sin6_port));
+		fnv1a_step(&hash, (unsigned char *)&ss->psaddr6.sin6_addr, sizeof(ss->psaddr6.sin6_addr));
+		fnv1a_step(&hash, (unsigned char *)&ss->psaddr6.sin6_port, sizeof(ss->psaddr6.sin6_port));	
+	} else if(ss->proto&IDF(ID_IPV4)){
+		fnv1a_step(&hash, (unsigned char*)&ss->lsaddr.sin_addr, sizeof(ss->lsaddr.sin_addr));
+		fnv1a_step(&hash, (unsigned char *)&ss->lsaddr.sin_port, sizeof(ss->lsaddr.sin_port));
+		fnv1a_step(&hash, (unsigned char *)&ss->psaddr.sin_port, sizeof(ss->psaddr.sin_port));
+		fnv1a_step(&hash, (unsigned char*)&ss->psaddr.sin_addr, sizeof(ss->psaddr.sin_addr));
+	} else {
+		return 0;
+	}
+	fnv1a_step(&hash, (unsigned char *)&ss->proto, sizeof(ss->proto));
+	if(!hash)
+		hash++;
+	return hash;
+}
+
+
+static struct sockstat_info * ssht_lookup(struct sockstat_info * req) {
+	uint64_t hash = sshf(req);
+	req->_hash = hash;
+	hash %= globals.ssht_len;
+	uint64_t init_hash = hash;
+	struct sockstat_info * i;
+	
+	pkt_logf("ssht_lookup l:%u:%d p:%u:%d proto=%d  hash=%lu \n", 
+			req->lsaddr.sin_addr.s_addr, req->lsaddr.sin_port,
+                        req->psaddr.sin_addr.s_addr, req->psaddr.sin_port,
+			req->proto, req->_hash);
+
+
+
+	for(;;) {
+		i = globals.ssht[hash];
+		/*
+		 * i can return here because element cannot be present behind a hole in hash table
+		 * 	( elements can only be added and never removed )
+		 * */
+		if(!i)
+			return NULL;	
+		if(i->_hash == req->_hash)
+		       return i;
+		hash = (hash + 1) % globals.ssht_len;
+		if(hash == init_hash)
+			return NULL;
+	}
+	return NULL;
+}
+
+
+static struct sockstat_info * ssht_row_lookup(struct td * row) { 
+	static struct sockstat_info buf;
+	if(!CVIS(SUMMARY_CIX))
+		return NULL;
+	int flags = IDF(ID_IPV4) | IDF(ID_IPV6) | IDF(ID_UDP) | IDF(ID_TCP);
+	buf.proto = row[SUMMARY_CIX].proto & flags;
+	if(!set_ss_sadr_from_row(row, &buf))
+		return NULL;
+	return ssht_lookup(&buf);
+}
+
 /*
  * return number of written bytes	
  * */
-int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
+static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 	
+	struct sockstat_info * si;
 	int wrote;
 	celltype_t celltype;
 
@@ -959,8 +1122,18 @@ int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 		else
 			wrote = sprintf(t->data[i][j].cstr, "!(err=%d)", errno);
 		break;
+	case CT_PINFO:
+		si = ssht_row_lookup(t->data[i]);
+		if(si) {
+			strncpy(t->data[i][j].cstr, si->pinfo, SS_PINFO_SZ);
+			/* just sanity thing here */
+			t->data[i][j].cstr[SS_PINFO_SZ-1] = 0;
+			wrote = strlen(t->data[i][j].cstr);
+		} else {
+			wrote = sprintf(t->data[i][j].cstr, "?");
+		}
+		break;
 	default:
-		
 		wrote = sprintf(t->data[i][j].cstr, "?");
 		break;
 	}
@@ -1064,27 +1237,6 @@ void initbl(struct table * t) {
 	pkt_logf("initbl allocated: %d bytes for %d cols\n", sizeof(struct td) * t->cols * t->maxrows, t->cols);
 }
 
-void expand_pi(struct process_info ** pi, int * len) {
-	if(!(*pi = realloc(*pi, sizeof(**pi) * *len)))
-		print_errno_exit(expand_pi realloc:)
-}
-
-#define SS_MAX_PD 80
-struct ss_line_info {
-	proto_t proto;
-	union {
-		struct in_addr laddr;
-		struct in6_addr laddr6;
-	};
-	union {
-		struct in_addr paddr;
-		struct in6_addr paddr6;
-	};
-	uint16_t lport;
-	uint16_t pport;
-	char process_desc[SS_MAX_PD];
-};
-
 static inline int is_white_char(char c) {
 	switch(c) {
 	case '\n':
@@ -1116,62 +1268,107 @@ char * skip_white_chars(char * buf, int r) {
 	return NULL;
 }
 
-static char inet_atonp_buf[24];
-
 /* 
  * this is not thread safe
- * parse ip and port in s of len l to in_addr and port 
- * return 0 on success, 1 on failed parse
+ * parse source ip4/ip6 cidr s which is of length l 
+ * 	into dst which must be at least sizeof(struct sockaddr_in6) 
+ * return 1 on success 0 on failure
  * */
-static int inet_atonp(const char * const s, int l, struct in_addr * a, uint16_t * p) {
-	char * x = memchr(s, ':', l);
-	if(!x)
-		return 1;
-	if(x-s > sizeof(inet_atonp_buf) -1)
+static int inet_atos(const char * const s, int l, void * dst) {
+	if(l <= 3)
 		return 0;
-	memcpy(inet_atonp_buf, s, x-s);
-	inet_atonp_buf[x-s] = 0;
-	if(inet_aton(inet_atonp_buf, a) != 1)
+	
+	static char addr_buf[80];
+	int isv6 = s[0] == '[';
+	char * sep = memchr(s, isv6 ? ']' : ':', l);
+	if(!sep)
 		return 0;
-	x++;
-	if(x-(s+l) > 5)
+	
+	if((sep-s) > (sizeof(addr_buf) -1))
 		return 0;
-	memcpy(inet_atonp_buf, x, x-(s+l));
-	inet_atonp_buf[x-(s+l)] = 0;
-	int _p = atoi(inet_atonp_buf);
+	memcpy(addr_buf, s, sep-s);
+	addr_buf[sep-s] = 0;
+
+	if(isv6) {
+		struct sockaddr_in6 * saddr6 = (struct sockaddr_in6*)dst;
+		saddr6->sin6_family = AF_INET6;
+		if(!inet_pton(AF_INET6, addr_buf + 1, &saddr6->sin6_addr))
+			return 0;
+		/* [::1]:ddddd
+		 *     ^
+		 *     because sep is here */
+		sep+=2;
+	} else {
+		struct sockaddr_in * saddr = (struct sockaddr_in*)dst;
+		saddr->sin_family = AF_INET;
+		if(!inet_aton(addr_buf, &saddr->sin_addr))
+			return 0;
+		/* 0.0.0.0:dddd
+		 *        ^
+		 *        because sep is here
+		 */
+		sep++;
+	}
+
+	int plen = (s+l) - sep;
+	if(plen > 5 || plen <= 0)
+		return 0;
+	memcpy(addr_buf, sep, plen);
+	addr_buf[plen] = 0;
+	int _p = atoi(addr_buf);
 	if(_p <= 0)
 		return 0;
-	*p = (uint16_t)_p;
+	if(isv6)
+		((struct sockaddr_in6*)dst)->sin6_port = _p;
+	else
+		((struct sockaddr_in*)dst)->sin_port = _p;
+	
+	return 1;
+}
+
+/* 1 if ok, 0 if not */
+static int parse_ss_saddr(char * start, char * end, void * dst, struct sockstat_info * i) {
+	if(!inet_atos(start, end-start, dst))
+		return 0;
+	unsigned short af = *((unsigned short*)dst);
+	switch(af) {
+	case AF_INET:
+		i->proto |= IDF(ID_IPV4);
+		break;
+	case AF_INET6:
+		i->proto |= IDF(ID_IPV6);
+		break;
+	default:
+		return 0;		
+	}
 	return 1;
 }
 
 /*
  *	return start of new line,
- *	...
+ *	buf must be null terminated
  * */
-static char * parse_ss_line(char * buf, int blen, struct ss_line_info * i) {
+static char * parse_ss_line(char * buf, struct sockstat_info * i) {
 	char * s;
 	int mode = 0;
+	
 	while(*buf) {
-		if(is_white_char(*buf)) {
-			buf = skip_white_chars(buf, 0);
-			if(!buf)
-				return NULL;
-		}
-		s = buf;
-		/* 1 means that we skip TO white char */
-		buf = skip_white_chars(buf, 1);
-		if(!buf)
+		if(!(buf = skip_white_chars(buf, 0)))
 			return NULL;
-
+		s = buf;
+		/* flag '1' means that we skip TO white char */
+		if(!(buf = skip_white_chars(buf, 1)))
+			return NULL;
 		switch(mode) {
 			/* Netid*/
 			case 0:
 				if((buf - s) != 3)
 					return NULL;
-				if(!memcmp(buf, "tcp", 3)) {
+				/* zero the proto on first use */
+				i->proto = 0;
+				if(!memcmp(s, "tcp", 3)) {
 					i->proto |= IDF(ID_TCP);
-				} else if(!memcmp(buf, "udp", 3)) {
+				} else if(!memcmp(s, "udp", 3)) {
 					i->proto |= IDF(ID_UDP);	
 				} else {
 					return NULL;
@@ -1181,35 +1378,93 @@ static char * parse_ss_line(char * buf, int blen, struct ss_line_info * i) {
 			/* State */
 			case 1:
 				mode++;
+				break;
 			/* recv-q */
 			case 2:
 				mode++;
+				break;
 			/* send-q */
 			case 3:
 				mode++;
+				break;
 			/* laddr:port */
 			case 4:	
-				if(inet_atonp(s, buf-s, &i->laddr, &i->lport))
+				if(!parse_ss_saddr(s, buf, &i->lsaddr, i))
 					return NULL;
 				mode++;
+				break;
 			/* paddr:port */
 			case 5:
-				if(inet_atonp(s, buf-s, &i->paddr, &i->pport))
+				if(!parse_ss_saddr(s, buf, &i->psaddr, i))
 					return NULL;
 				mode++;
+				break;
 			/* psum */
 			case 6:
-				memcpy(i->sss, )
-				break;
+				if(buf-s >= SS_PINFO_SZ) {	
+					memcpy(i->pinfo, s, SS_PINFO_SZ-1);
+					i->pinfo[SS_PINFO_SZ-1] = 0;
+				} else {
+					memcpy(i->pinfo, s, buf-s);
+					i->pinfo[buf-s] = 0;
+				}
+				buf = skip_white_chars(buf, 0);
+				/* if next line exists then return it */
+				if(buf)
+					return buf;
+				/* otherwise return end of string */
+				s += strlen(s);
+				return s;
+			default:
+				return NULL;
 		}
-	}		
+	}
+	return NULL;	
 }
 
-void get_process_info(struct process_info ** buf, int * len) {
+/* insert into ssht, which is of len ssht_len, element ss.
+ * note that ss will be copied and mallocked.
+ * return 1 on success, 0 on failure 
+ * */
+int insert_ssht(struct sockstat_info ** ssht, int ssht_len, struct sockstat_info *ss) {
+	uint64_t hash = sshf(ss);
+	if(!hash)
+		return 0;
+	ss->_hash = hash;
+
+	hash %= ssht_len;
 	
-	if(*buf == NULL || *len == 0) {
-		*len = INIT_PI_LEN;
-		expand_pi(buf, len);	
+	uint64_t initial_hash = hash;
+	struct sockstat_info ** sp;
+
+	for(;;) {
+		sp = &ssht[hash];
+		if(!*sp) {
+			*sp = malloc(sizeof(struct sockstat_info));
+			break;
+		}
+		hash = (hash + 1) % ssht_len;
+		if(hash == initial_hash)
+			return 0;
+		
+	};
+	
+	memcpy(*sp, ss, sizeof(**sp));
+
+	return 1;
+}
+
+void set_ssht(struct sockstat_info ** ssht, int ssht_len) {
+	
+	if(ssht == NULL || ssht_len == 0) {
+		return;
+	}
+
+	for(int i = 0; i < ssht_len; i++) {
+		if(!ssht[i])
+			continue;
+		free(ssht[i]);
+		ssht[i] = NULL;
 	}
 
 	pid_t pid;
@@ -1242,8 +1497,9 @@ void get_process_info(struct process_info ** buf, int * len) {
 			 * -p = show process
 			 * -H = suppress header
 			 * -O = one line
+			 * -n = dont try to resolve service names
 			 * */
-			execl(paths[i], "ss", "-tpuHO", NULL);
+			execl(paths[i], "ss", "-tpuHOn", NULL);
 		}	
 
 		/* if we are here then all of the execl must have failed */
@@ -1264,80 +1520,132 @@ void get_process_info(struct process_info ** buf, int * len) {
 		goto ERR;
 	}
 
-	static char proto[8];
-	static char n[16];
-	static char saddr[56];
-	static char daddr[56];
-	static char pd[160];
-	static char pistr[512];
+	static char pistr[2048];
 	char * pistr_ptr = pistr;
-	int pistr_len = -1;
-	int pistr_offset = 0;
-	int nonce = 0;
+	char * parsed = NULL;
+	int pistr_len = sizeof(pistr) - 1;
+	int nonce = 0, off = 0;
+	static struct sockstat_info li;
 
 	for(;;) {
-		pistr_len = read(pipefd[0], pistr+pistr_offset, sizeof(pistr) - 1 - pistr_offset);
+		/* couldn't parse full buffer */
+		if(pistr_len <= 0) {
+			pkt_logf("%s: warn: unrecognized ss format, or buffer too small\n", __func__);
+			break;
+		}
+		pistr_len = read(pipefd[0], pistr_ptr, pistr_len);
 		if(pistr_len <= 0)
 			break;
-		pkt_logf("%d, %d\n", pistr_len, pistr_offset);
-		pistr_len += pistr_offset;
-		pistr[pistr_len] = 0;
+		/* pkt_logf("done read, pistr_len = %d += %d, pistr_ptr reset\n", pistr_len, pistr_ptr-pistr); */
+		pistr_ptr[pistr_len] = 0;
+		pistr_len += pistr_ptr-pistr;
 		pistr_ptr = pistr;
-	
-		pkt_logf("%s\n", pistr_ptr);	
 
-		if(!nonce && (!WIFEXITED(status) || WEXITSTATUS(status))) {
-			pkt_logf("%s: call to ss failed '%s'\n", __func__, pistr);
-			goto ERR;
-		}
-		if(!nonce)
+		if(!nonce) {
+		       	if(!WIFEXITED(status) || WEXITSTATUS(status)) {
+				pkt_logf("%s: call to ss failed '%s'\n", __func__, pistr);
+				goto ERR;
+			}
 			nonce = 1;
-		
+		}
+	
 		for(;;) {
-			if(sscanf(pistr_ptr, "%3s %15s %15s %15s %55s %55s %159s \n", 
-					proto, n, n, n, saddr, daddr, pd) != 7) {
-				/* we still may have other end of the line waiting in the kernel buffer */
-				pistr_offset = strlen(pistr_ptr);
-				memcpy(pistr, pistr_ptr, pistr_offset);
+			/* bzero(&li, sizeof(li)); */
+			parsed = parse_ss_line(pistr_ptr, &li);
+			if(!parsed) {
+				off = (pistr+pistr_len) - pistr_ptr;		
+				/* pkt_logf("failed to parse, offset=%d len=%d\n", off, sizeof(pistr)-1-off);*/
+				memcpy(pistr, pistr_ptr, off);
+				pistr_ptr = pistr+off;
+				pistr_len = sizeof(pistr) - 1 - off;
 				break;
 			}
-
-			pkt_logf("%s %s %s %s\n", proto, saddr, daddr, pd);
-			pistr_ptr = strchr(pistr_ptr, '\n');
-
-			if(!pistr_ptr) {
-				pistr_offset = 0;
-				break;
+			
+			if(!insert_ssht(ssht, ssht_len, &li)) {
+				pkt_logf("%s: couldn't insert ss info into ssht\n", __func__);
+				goto ERR;
 			}
-			pistr_ptr++;	
+
+			pistr_ptr = parsed;
+			if(!*parsed) {
+				pistr_ptr = pistr;
+				pistr_len = sizeof(pistr) - 1;
+				break;
+			}	
 		}
 
+	}
+
+	static char sip[96];
+	static char dip[96];
+
+	for(int i = 0; i < ssht_len; i++) {
+		if(!ssht[i])
+			continue;
+		if(ssht[i]->proto&IDF(ID_IPV4)) {
+			strcpy(sip, inet_ntoa(ssht[i]->lsaddr.sin_addr));
+			strcpy(dip, inet_ntoa(ssht[i]->psaddr.sin_addr));
+			int sx = strlen(sip);
+			sprintf(sip+sx, ":%d", ssht[i]->lsaddr.sin_port);
+			sx = strlen(dip);
+			sprintf(dip+sx, ":%d", ssht[i]->psaddr.sin_port);
+		} else if(ssht[i]->proto&IDF(ID_IPV6)) {
+			bzero(sip, sizeof(sip));
+			bzero(dip, sizeof(dip));
+			inet_ntop(AF_INET6, &ssht[i]->lsaddr6.sin6_addr, sip, sizeof(sip));
+			inet_ntop(AF_INET6, &ssht[i]->psaddr6.sin6_addr, dip, sizeof(dip));
+		} else {
+			pkt_log("no\n");
+			return;
+		}
+
+		pkt_logf("ssht: %d (%lu) %s %s %s\n", 
+			i, ssht[i]->_hash, 
+			ssht[i]->pinfo,
+			sip, dip);
+
+		if(!ssht_lookup(ssht[i])) {
+			pkt_log("not found\n");
+			exit(1);
+		}
 	}
 
 	return;
 ERR:
 	pkt_logf("won't try to %s any more\n", __func__);
-	*len = 0;
 	opts.p = 0;
 }
 
+#define CLOCK_DIF_MICRO(start, end) (1e6 * (float)((end)-(start)) / CLOCKS_PER_SEC)
 
 void * run_readloop(void * args) {
-	get_process_info(&globals.proc_infos, &globals.proc_infos_len);
-	exit(1);
-
 	pkt_logf("started readloop\n");
+
+#if defined(DBG1)	
+	clock_t start, end;
+#endif
+
 	for(;;) {
+		if(opts.p) {
 #if defined(DBG1)
-		clock_t start = clock();
+			start = clock();
+#endif	
+			set_ssht(globals.ssht, globals.ssht_len);
+#if defined(DBG1)
+			end = clock();
+			pkt_logf1("set_ssht done in %.1f μs\n", CLOCK_DIF_MICRO(start, end));
+#endif
+		}
+#if defined(DBG1)
+		start = clock();
 #endif
 		if(pthread_spin_lock(&globals.sync)) 
 			print_errno_exit(run_readloop:);
 		printbl(&globals.t);
 		pthread_spin_unlock(&globals.sync);
 #if defined(DBG1)
-		clock_t end = clock();		
-		pkt_logf1("printbl done in %.1f μs\n", 1e6 * (float)(end-start) / CLOCKS_PER_SEC);
+		end = clock();		
+		pkt_logf1("printbl done in %.1f μs\n", CLOCK_DIF_MICRO(start, end));
 #endif		
 		sleep(opts.i);
 	}
@@ -1350,6 +1658,15 @@ void pkt_logf_laddr6() {
 		print_errno_exit(inet_ntop laddr6: );
 	}
 	pkt_logf("laddr6: %s\n", buff);
+}
+
+void init_ssht() {
+	globals.ssht_len = 160;
+	globals.ssht = calloc(globals.ssht_len, sizeof(*globals.ssht));
+	if(!globals.ssht)
+		print_errno_exit(ssht calloc:);
+	pkt_logf("init_ssht allocated %d bytes for hashtable (len=%d)\n", 
+			globals.ssht_len * sizeof(*globals.ssht), globals.ssht_len);
 }
 
 int main(int argc, char *argv[]) {
@@ -1406,6 +1723,9 @@ int main(int argc, char *argv[]) {
 	signal(SIGINT, cleanup);
 
 	initbl(&globals.t);
+
+	if(opts.p)
+		init_ssht();
 
 	pthread_spin_init(&globals.sync, 0);
 	
