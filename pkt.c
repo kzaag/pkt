@@ -1137,13 +1137,14 @@ static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 			tmpl = iter + 1;
 			if(MCSZ(j) > sizeof(term) && iter > 0 &&
 					t->data[i][j].cstr[0] != '?') {
-				while(iter >= (sizeof(term)-1)) {
-					if((tmpl-iter-1) < sizeof(term)-1) {
-						t->data[i][j].cstr[iter] = '.';
-					} else {
-						t->data[i][j].cstr[iter] = 
-							t->data[i][j].cstr[iter - (sizeof(term)-1)];
-					}
+				
+				if((MCSZ(j) - (tmpl+1)) > (sizeof(term)-1)) {
+					iter += sizeof(term)-1;
+					wrote = sizeof(term)-1 + tmpl;
+				}
+				while(iter >= (sizeof(term)-1)) {	
+					t->data[i][j].cstr[iter] = 
+						t->data[i][j].cstr[iter - (sizeof(term)-1)];
 					iter--;
 				}
 				memcpy(t->data[i][j].cstr, term, sizeof(term)-1);
@@ -1154,7 +1155,8 @@ static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 				/* if row was tainted - forced refresh was demanded,
 				 * then force override whatever was inside the cell
 				 * */
-				if(t->rowspec[i].frefresh || strncmp(term, t->data[i][j].cstr, sizeof(term) - 1))
+				if(t->rowspec[i].frefresh || 
+						strncmp(term, t->data[i][j].cstr, sizeof(term) - 1))
 					wrote = sprintf(t->data[i][j].cstr, "?");
 			}
 		}
