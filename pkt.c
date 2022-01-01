@@ -1199,7 +1199,7 @@ void printbl(struct table * t) {
 void initbl(struct table * t) {
 
 
-	int maxcap = 20;
+	int maxcap = 40;
 	/* predefined limit + 1 to account for header row */
 	t->maxrows = maxcap + 1;
 	/* 1 because of header row */
@@ -1470,11 +1470,14 @@ void set_ssht(struct sockstat_info ** ssht, int ssht_len) {
 	pid_t pid;
 	int status;
 	int pipefd[2];
+	int close_pipe = 0;
 
 	if(pipe(pipefd)) {
 		pkt_logf("%s: pipe: %s\n", __func__, strerror(errno));
 		goto ERR;
 	}
+
+	close_pipe = 1;
 
 	if((pid = fork()) == 0) {
 		/* replace stdout, stderr, and close pipe - not needed any more  */
@@ -1575,48 +1578,14 @@ void set_ssht(struct sockstat_info ** ssht, int ssht_len) {
 		}
 
 	}
-
-#if defined(DBG1)
-
-	static char sip[96];
-	static char dip[96];
-
-	for(int i = 0; i < ssht_len; i++) {
-		if(!ssht[i])
-			continue;
-		if(ssht[i]->proto&IDF(ID_IPV4)) {
-			strcpy(sip, inet_ntoa(ssht[i]->lsaddr.sin_addr));
-			strcpy(dip, inet_ntoa(ssht[i]->psaddr.sin_addr));
-			int sx = strlen(sip);
-			sprintf(sip+sx, ":%d", ssht[i]->lsaddr.sin_port);
-			sx = strlen(dip);
-			sprintf(dip+sx, ":%d", ssht[i]->psaddr.sin_port);
-		} else if(ssht[i]->proto&IDF(ID_IPV6)) {
-			bzero(sip, sizeof(sip));
-			bzero(dip, sizeof(dip));
-			inet_ntop(AF_INET6, &ssht[i]->lsaddr6.sin6_addr, sip, sizeof(sip));
-			inet_ntop(AF_INET6, &ssht[i]->psaddr6.sin6_addr, dip, sizeof(dip));
-		} else {
-			pkt_log("no\n");
-			return;
-		}
-
-		pkt_logf("ssht: %d (%lu) %s %s %s\n", 
-			i, ssht[i]->_hash, 
-			ssht[i]->pinfo,
-			sip, dip);
-
-		if(!ssht_lookup(ssht[i])) {
-			pkt_log("not found\n");
-			exit(1);
-		}
-	}
-#endif
-
+	if(close_pipe)
+		close(pipefd[0]);
 	return;
 ERR:
 	pkt_logf("won't try to %s any more\n", __func__);
 	opts.p = 0;
+	if(close_pipe)
+		close(pipefd[0]);
 }
 
 #define CLOCK_DIF_MICRO(start, end) (1e6 * (float)((end)-(start)) / CLOCKS_PER_SEC)
