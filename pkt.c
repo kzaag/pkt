@@ -1380,6 +1380,7 @@ static char * parse_ss_line(char * buf, struct sockstat_info * i) {
 	
 	/*must at least contain null terminator (with sizeof = 1) */
 	static const char overflow_term[] = "...";
+	static const char skip_pinfo_pref[] = "users:";
 
 	while(*buf) {
 		if(!(buf = skip_white_chars(buf, 0)))
@@ -1430,6 +1431,10 @@ static char * parse_ss_line(char * buf, struct sockstat_info * i) {
 				break;
 			/* psum */
 			case 6:
+				if(buf-s > sizeof(skip_pinfo_pref)-1) {
+					if(!memcmp(s, skip_pinfo_pref, sizeof(skip_pinfo_pref)-1))
+						s+=sizeof(skip_pinfo_pref)-1;
+				}
 				if(buf-s >= SS_PINFO_SZ) {	
 					memcpy(i->pinfo, s, SS_PINFO_SZ-sizeof(overflow_term));
 					memcpy(i->pinfo+SS_PINFO_SZ-sizeof(overflow_term), 
