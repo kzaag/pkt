@@ -1027,13 +1027,11 @@ static struct sockstat_info * ssht_lookup(struct sockstat_info * req) {
 	hash %= globals.ssht_len;
 	uint64_t init_hash = hash;
 	struct sockstat_info * i;
-	
+
 	pkt_logf1("ssht_lookup l:%u:%d p:%u:%d proto=%d  hash=%lu \n", 
 			req->lsaddr.sin_addr.s_addr, req->lsaddr.sin_port,
                         req->psaddr.sin_addr.s_addr, req->psaddr.sin_port,
 			req->proto, req->_hash);
-
-
 
 	for(;;) {
 		i = globals.ssht[hash];
@@ -1068,9 +1066,10 @@ static struct sockstat_info * ssht_row_lookup(struct td * row) {
  * return number of written bytes	
  * */
 static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
-	
+	int iter, tmpl;
 	struct sockstat_info * si;
 	int wrote;
+	static const char term[] = "?T:";
 	celltype_t celltype;
 
 	celltype = t->data[i][j].celltype;
@@ -1113,7 +1112,10 @@ static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 		if(now < 1 || t->data[i][j].time < 1)
 			wrote = sprintf(t->data[i][j].cstr, "?");
 		else
-			wrote = snprintf_time(t->data[i][j].cstr, MCSZ(j), now - t->data[i][j].time);
+			wrote = snprintf_time(
+					t->data[i][j].cstr, 
+					MCSZ(j), 
+					now - t->data[i][j].time);
 		break;
 	
 	case CT_IN6ADDR:
@@ -1123,6 +1125,7 @@ static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 			wrote = sprintf(t->data[i][j].cstr, "!(err=%d)", errno);
 		break;
 	case CT_PINFO:
+		wrote = 0;
 		si = ssht_row_lookup(t->data[i]);
 		if(si) {
 			strncpy(t->data[i][j].cstr, si->pinfo, SS_PINFO_SZ);
@@ -1130,7 +1133,30 @@ static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 			t->data[i][j].cstr[SS_PINFO_SZ-1] = 0;
 			wrote = strlen(t->data[i][j].cstr);
 		} else {
-			wrote = sprintf(t->data[i][j].cstr, "?");
+			iter = strlen(t->data[i][j].cstr) - 1;
+			tmpl = iter + 1;
+			if(MCSZ(j) > sizeof(term) && iter > 0 &&
+					t->data[i][j].cstr[0] != '?') {
+				while(iter >= (sizeof(term)-1)) {
+					if((tmpl-iter-1) < sizeof(term)-1) {
+						t->data[i][j].cstr[iter] = '.';
+					} else {
+						t->data[i][j].cstr[iter] = 
+							t->data[i][j].cstr[iter - (sizeof(term)-1)];
+					}
+					iter--;
+				}
+				memcpy(t->data[i][j].cstr, term, sizeof(term)-1);
+				if(tmpl <= sizeof(term)) {
+					t->data[i][j].cstr[sizeof(term)-1] = 0;	
+				}
+			} else {
+				/* if row was tainted - forced refresh was demanded,
+				 * then force override whatever was inside the cell
+				 * */
+				if(t->rowspec[i].frefresh || strncmp(term, t->data[i][j].cstr, sizeof(term) - 1))
+					wrote = sprintf(t->data[i][j].cstr, "?");
+			}
 		}
 		break;
 	default:
@@ -1199,7 +1225,7 @@ void printbl(struct table * t) {
 void initbl(struct table * t) {
 
 
-	int maxcap = 40;
+	int maxcap = 20;
 	/* predefined limit + 1 to account for header row */
 	t->maxrows = maxcap + 1;
 	/* 1 because of header row */
@@ -1352,6 +1378,9 @@ static char * parse_ss_line(char * buf, struct sockstat_info * i) {
 	char * s;
 	int mode = 0;
 	
+	/*must at least contain null terminator (with sizeof = 1) */
+	static const char overflow_term[] = "...";
+
 	while(*buf) {
 		if(!(buf = skip_white_chars(buf, 0)))
 			return NULL;
@@ -1402,8 +1431,10 @@ static char * parse_ss_line(char * buf, struct sockstat_info * i) {
 			/* psum */
 			case 6:
 				if(buf-s >= SS_PINFO_SZ) {	
-					memcpy(i->pinfo, s, SS_PINFO_SZ-1);
-					i->pinfo[SS_PINFO_SZ-1] = 0;
+					memcpy(i->pinfo, s, SS_PINFO_SZ-sizeof(overflow_term));
+					memcpy(i->pinfo+SS_PINFO_SZ-sizeof(overflow_term), 
+							overflow_term, sizeof(overflow_term));
+					/* i->pinfo[SS_PINFO_SZ-1] = 0; */
 				} else {
 					memcpy(i->pinfo, s, buf-s);
 					i->pinfo[buf-s] = 0;
@@ -1578,6 +1609,17 @@ void set_ssht(struct sockstat_info ** ssht, int ssht_len) {
 		}
 
 	}
+
+#if defined(DBG1)
+	for(int i = 0; i < ssht_len; i++) {
+		if(!ssht[i])
+			continue;
+		if(!ssht_lookup(ssht[i])) {
+			pkt_logf("%s: couldn't perform lookup for existing element\n", __func__);
+		}
+	}
+#endif
+
 	if(close_pipe)
 		close(pipefd[0]);
 	return;
@@ -1595,32 +1637,36 @@ void * run_readloop(void * args) {
 
 #if defined(DBG1)	
 	clock_t start, end;
-#endif
-
 	for(;;) {
 		if(opts.p) {
-#if defined(DBG1)
 			start = clock();
-#endif	
 			set_ssht(globals.ssht, globals.ssht_len);
-#if defined(DBG1)
 			end = clock();
 			pkt_logf1("set_ssht done in %.1f μs\n", CLOCK_DIF_MICRO(start, end));
-#endif
 		}
-#if defined(DBG1)
 		start = clock();
+		if(pthread_spin_lock(&globals.sync))
+			print_errno_exit(run_readloop:)
+		printbl(&globals.t);
+		pthread_spin_unlock(&globals.sync);
+		end = clock();
+                pkt_logf1("printbl done in %.1f μs\n", CLOCK_DIF_MICRO(start, end));
+		sleep(opts.i);
+	}
+	return NULL;
 #endif
+	
+	for(;;) {
+		if(opts.p) {
+			set_ssht(globals.ssht, globals.ssht_len);
+		}
 		if(pthread_spin_lock(&globals.sync)) 
 			print_errno_exit(run_readloop:);
 		printbl(&globals.t);
 		pthread_spin_unlock(&globals.sync);
-#if defined(DBG1)
-		end = clock();		
-		pkt_logf1("printbl done in %.1f μs\n", CLOCK_DIF_MICRO(start, end));
-#endif		
 		sleep(opts.i);
 	}
+
 	return NULL;
 }
 
