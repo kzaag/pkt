@@ -3,4 +3,7 @@ bin/**
 .vscode/**
 .*
 !.gitignore
+ip2ldb
+tmp
+
 
