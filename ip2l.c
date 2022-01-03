@@ -141,7 +141,7 @@ int search_in(const char * fpath, struct in_addr x, char * lb, int lb_len) {
 		return (code); }
 
 	for(;;) {
-		if(left >= right)
+		if(left > right)
 			creturn(IP2L_ERR_NOT_FOUND);
 
 		m = (left+right) / 2;
@@ -182,15 +182,13 @@ int search_in(const char * fpath, struct in_addr x, char * lb, int lb_len) {
 			
 			if(saddr.s_addr > x.s_addr) {
 				/* look left */
-				if(m == 0)
-					creturn(IP2L_ERR_NOT_FOUND);
 				right = m - 1;
 				break;
 			}
 
 			if(daddr.s_addr < x.s_addr) {
 				/* look right */
-				left = m;
+				left = m + 1;
 				break;
 			}
 

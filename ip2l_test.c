@@ -54,5 +54,14 @@ int main() {
 	test_ip("1.0.130.113", px11path);
 	test_ip("223.255.247.205", px11path);
 	test_ip("255.255.255.255", px11path);
+
+	printf("#### TESTING ASNs ####\n");
+
+	test_ip("0.0.0.0", asnpath);
+	test_ip("1.0.0.0", asnpath);
+	test_ip("1.0.5.1", asnpath);
+	test_ip("255.255.255.255", asnpath);
+	test_ip("224.0.0.0", asnpath);
+	test_ip("157.240.0.0", asnpath);
 }
 
