@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "ip2l.h"
 
@@ -44,13 +45,11 @@ static long long parse_in(char * seek_buf, int start, int len, char ** end) {
 	return taddr;
 }
 
-#define LINE_BUF_SZ 320
-
 /* write line starting at current fd position into lb which must be at least lbl long
  * return IP2L_ERR_EFORMAT if buffer too small
  * return 0 if ok, IP2L_ERR if not. 
  * */
-static int grab_line(int fd, char * lb, int lbl) {
+static int grab_line(int fd, char * lb, int * lbl) {
 	static char line[LINE_BUF_SZ];
 	int i;
 	int f = 0;
@@ -67,11 +66,12 @@ static int grab_line(int fd, char * lb, int lbl) {
 		}
 	}
 
-	if(!f || i >= lbl)
+	if(!f || i >= *lbl)
 		return IP2L_ERR_EFORMAT;
 
 	memcpy(lb, line, i);
 	lb[i] = 0;
+	*lbl = i;
 
 	return 0;
 }
@@ -87,7 +87,7 @@ static int grab_line(int fd, char * lb, int lbl) {
  *                         return offset in relation to buf
  * return 0 on fail
  * */
-static int try_parse_inaddr_pair(
+static int parse_inaddr_pair(
 		char * buf, int l, 
 		struct in_addr * a, 
 		struct in_addr * b) {
@@ -116,7 +116,7 @@ static int try_parse_inaddr_pair(
 	return endp-buf;
 }
 
-int search_in(const char * fpath, struct in_addr x, char * lb, int lb_len) {
+int search_in(const char * fpath, struct in_addr x, char * lb, int * lb_len) {
 	static char seek_buf[LINE_BUF_SZ];
 	const int max = sizeof(seek_buf);
 	int fd = open(fpath, O_RDONLY);
@@ -162,24 +162,21 @@ int search_in(const char * fpath, struct in_addr x, char * lb, int lb_len) {
 		start = -1;
 
 		while(++start < r) {
-			if((m || start) &&  seek_buf[start] != '\n') {
-				continue;
+			if(m || start) {
+				if(seek_buf[start] != '\n')
+					continue;
+				start++;
 			}
 
-			if(seek_buf[start] == '\n')
-				start++;
-			
 			sol = start;
 
-			//printf("try parse: %*.*s\n", r-start, r-start, seek_buf+start);
-
-			if(try_parse_inaddr_pair(
+			if(parse_inaddr_pair(
 					seek_buf+start, 
 					r-start, 
-					&saddr, &daddr) < 0) {
+					&saddr, &daddr) <= 0) {
 				continue;
 			}
-			
+
 			if(saddr.s_addr > x.s_addr) {
 				/* look left */
 				right = m - 1;
@@ -199,8 +196,210 @@ int search_in(const char * fpath, struct in_addr x, char * lb, int lb_len) {
 			creturn(nosteps);
 		}
 
-		if(start == r)
+		if(start >= r)
 			creturn(IP2L_ERR_NOT_FOUND);
 	}
+}
+
+const char delim[] = {'"', ',', '"'};
+
+/* 0 if was ok otherwise 1 */
+static inline int skip_delim(char ** s, int * len) {
+	if(*len < sizeof(delim))
+		return -1;
+	if(memcmp(*s, delim, sizeof(delim)))
+		return -1;
+	*s += sizeof(delim);
+	*len -= sizeof(delim);
+	return 0;
+}
+
+static inline int skip_to_delim(char ** s, int * len) {
+	for(int i = 0; i < *len; i++) {
+		if((*s)[i] == delim[0] && 
+				*len > i + sizeof(delim) &&
+				!memcmp(*s + i, delim, sizeof(delim))) {
+			*s += i;
+			*len -= i;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/* apparently ip2l csvs terminate lines with crlf.
+ * so this function is gonna put cursor to that char
+ * */
+static inline int skip_to_end(char ** s, int * len) {
+	for(int i = 0; i < *len; i++) {
+		if((*s)[i] == '\r' && i == *len - 1) {
+			*s += i;
+			*len -= i;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static inline int skip_field(char ** s, int * len) {
+	if(skip_delim(s, len))
+		return -1;
+	if(skip_to_delim(s, len))
+		return -1;
+	return skip_delim(s, len);
+}
+
+static inline int skip_cfield(char ** s, int * l) {
+	if(skip_to_delim(s, l))
+                return -1;
+        return skip_delim(s, l);
+}
+
+static inline int fieldcpy(char * f, int flen, char * dst, int dstlen) {
+	if(flen < 0 || dstlen < 1)
+		return -1;
+	dstlen--;
+	if(flen > dstlen)
+		flen = dstlen;
+	memcpy(dst, f, flen);
+	dst[flen] = 0;
+	return 0;
+}
+
+/*
+ * -1 on failure, 0 on success
+ * */
+int parse_db11_line(struct db11 * dst, char * line, int len) {
+	int off;
+	if((off = parse_inaddr_pair(line, len, &dst->start, &dst->end)) <= 0) {
+		return -1;
+	}
+	line += off;
+	len-=off;
+
+	if(skip_field(&line, &len))
+		return -1;
+	
+	char * f = line;
+	int fl;
+
+	if(skip_to_delim(&line, &len))
+		return -1;
+
+	fl = line - f;
+
+	if(fieldcpy(f, fl, dst->country, COUNTRY_SIZE))
+		return -1;
+
+	if(skip_field(&line, &len))
+		return -1;
+
+	f = line;
+	if(skip_to_delim(&line, &len))
+		return -1;
+
+	fl = line - f;
+
+	if(fieldcpy(f, fl, dst->city, CITY_SIZE))
+		return -1;
+	
+	return 0;
+}
+
+int skip_fieldcpy(char ** line, int * len, char * dst, int dstl) {
+	char * f = *line;
+	if(skip_to_delim(line, len))
+		return -1;
+	int fl = *line - f;
+	if(fieldcpy(f, fl, dst, dstl))
+		return -1;
+	return skip_delim(line, len);
+}
+
+/*
+ * -1 on failure, 0 on success
+ * */
+int parse_asn_line(struct asn * dst, char * line, int len) {
+	int off;
+	if((off = parse_inaddr_pair(line, len, &dst->start, &dst->end)) <= 0) {
+		return -1;
+	}
+	line += off;
+	len-=off;
+
+	if(skip_delim(&line, &len))
+		return -1;
+
+	if(skip_fieldcpy(&line, &len, dst->iprange, NET_SIZE))
+		return -1;
+
+
+	char asnbuf[11];
+
+	if(skip_fieldcpy(&line, &len, asnbuf, sizeof(asnbuf)))	
+		return -1;
+		
+	dst->asn = atol(asnbuf);
+
+	char * f = line;
+	if(skip_to_end(&line, &len))
+		return -1;	
+	int fl = line - f;
+	if(fieldcpy(f, fl, dst->asname, ASNAME_SIZE))
+		return -1;
+
+	return 0;
+}
+
+int parse_px11_line(struct px11 * dst, char * line, int len) {
+	int off;
+        if((off = parse_inaddr_pair(line, len, &dst->start, &dst->end)) <= 0) {
+                return -1;
+        }
+        line += off;
+        len-=off;
+	
+      	if(skip_delim(&line, &len))
+		return -1;
+	
+	if(skip_fieldcpy(&line, &len, dst->proxy_type, PROXY_TYPE_SIZE))
+		return -1;
+
+	if(skip_cfield(&line, &len))
+		return -1;
+
+	if(skip_fieldcpy(&line, &len, dst->country, COUNTRY_SIZE))
+                return -1;
+
+	if(skip_cfield(&line, &len))
+		return -1;
+
+	if(skip_fieldcpy(&line, &len, dst->city, CITY_SIZE))
+		return -1;
+	
+	if(skip_fieldcpy(&line, &len, dst->isp, ISP_SIZE))
+		return -1;
+
+	if(skip_fieldcpy(&line, &len, dst->domain, DOMAIN_SIZE))
+		return -1;
+
+	if(skip_fieldcpy(&line, &len, dst->usage_type, USAGE_TYPE_SIZE))
+		return -1;
+
+	char asnbuf[16];
+	if(skip_fieldcpy(&line, &len, asnbuf, sizeof(asnbuf)))
+		return -1;
+	dst->asn = atol(asnbuf);
+
+	if(skip_fieldcpy(&line, &len, dst->asname, ASNAME_SIZE))
+		return -1;
+
+	if(skip_cfield(&line, &len))
+		return -1;
+
+	if(skip_fieldcpy(&line, &len, dst->threat, THREAT_SIZE))
+		return -1;
+
+	return 0;
 }
 
