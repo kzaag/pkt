@@ -411,7 +411,10 @@ struct td {
 #define TDTP(row, cix) row[cix].celltype ? row[cix].celltype : CTP(cix) 
 
 struct rowspec {
-	uint8_t frefresh;
+	/* if set to 1 on next iteration row will be rerendered	
+	 * then tainted will be reset
+	 * */
+	uint8_t tainted;
 };
 
 struct table {
@@ -870,7 +873,7 @@ void upsert(struct table * t, struct pkt_digest * dg) {
 
 	if(t->rows >= t->maxrows) {
 		row = t->data[t->rows - 1];
-		t->rowspec[t->rows - 1].frefresh = 1;
+		t->rowspec[t->rows - 1].tainted = 1;
 	} else {
 		row = t->data[t->rows];
 		t->rows++;
@@ -1230,7 +1233,7 @@ static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 				/* if row was tainted - forced refresh was demanded,
 				 * then force override whatever was inside the cell
 				 * */
-				if(t->rowspec[i].frefresh || 
+				if(t->rowspec[i].tainted || 
 						strncmp(term, t->data[i][j].cstr, sizeof(term) - 1))
 					wrote = sprintf(t->data[i][j].cstr, "?");
 			}
@@ -1259,16 +1262,16 @@ void printbl(struct table * t) {
 			if(!CVIS(j)) 
 				continue;
 
-			if(t->rowspec[i].frefresh || !t->data[i][j].cstr[0] || (!CRDONLY(j) && i > 0)) {	
+			if(t->rowspec[i].tainted || !t->data[i][j].cstr[0] || (!CRDONLY(j) && i > 0)) {	
 				wrote = write_into_cell_cstr(t, i, j, now) + 1;
 				if(wrote > CCSZ(j))
 					CCSZ(j) = wrote;
 			}
 		}
 
-		if(t->rowspec[i].frefresh)
+		if(t->rowspec[i].tainted)
 
-			t->rowspec[i].frefresh = 0;
+			t->rowspec[i].tainted = 0;
 	}
 
 	sort(t);
