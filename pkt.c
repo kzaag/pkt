@@ -150,9 +150,9 @@ struct sockstat_info {
 	uint64_t _hash;
 };
 
-#define GEO_INFO_SZ  40
-#define PROXY_INFO_SZ 80
-#define ASN_INFO_SZ  40
+#define GEO_INFO_SZ  (COUNTRY_SIZE + 3 + CITY_SIZE + 1)
+#define PROXY_INFO_SZ (2 + PROXY_TYPE_SIZE + 2 + ISP_SIZE + 4 + DOMAIN_SIZE + 4 + USAGE_TYPE_SIZE + 5 + THREAT_SIZE)
+#define ASN_INFO_SZ  (10 + 3 + ASNAME_SIZE)
 struct in_info {
 	struct in_addr a;
 	char geo[GEO_INFO_SZ];
@@ -371,12 +371,12 @@ struct {
 	
 	/* try to obtain process info */
 	int p;
+	
+	/* are inet info statistics enabled */
+	int wiif;
 
 } opts = {
-	.d = NULL,
 	.i = 1,
-	.r = 0,
-	.p = 0
 };
 
 
@@ -408,17 +408,17 @@ struct td {
 };
 
 /* cell type */
-#define TDTP(row, cix) row[cix].celltype ? row[cix].celltype : CTP(cix) 
+#define TDTP(row, cix) (row[(cix)].celltype ? row[(cix)].celltype : CTP(cix)) 
 
 struct rowspec {
 	/* if set to 1 on next iteration row will be rerendered	
-	 * then tainted will be reset
+	 * then this flag will be reset
 	 * */
 	uint8_t tainted;
 };
 
 struct table {
-	/* rows are first, then columns, then table cell */
+	/* rows are first, then columns, then table cells */
 	struct td ** data;
 	unsigned short maxrows;
 	unsigned short rows;
@@ -426,6 +426,12 @@ struct table {
 	/* be very careful when handling this array.
 	   data may be sorted and reordered. In that case rowspec will refer to wrong rows */
 	struct rowspec * rowspec;
+};
+
+struct in_info_t {
+	struct in_info * data;
+	int cap;
+	int len;
 };
 
 static struct globals {
@@ -444,18 +450,11 @@ static struct globals {
 
 	struct sockstat_info ** ssht;
 	int ssht_len;
-} globals = {
-	.pcap_handle = NULL,
-	.wladdr = 0,
-	.dlt = -1,
-	.wladdr6 = 0,
-	.t = {
-		.data = NULL
-	},
-	.rthr = 0,
 
-	.ssht = NULL,
-	.ssht_len = 0
+	struct in_info_t iif;
+
+} globals = {
+	.dlt = -1,
 };
 
 int init_opts(int argc, char * argv[])
@@ -547,16 +546,20 @@ int init_opts(int argc, char * argv[])
 				switch(optarg[i]) {
 				case 'g':
 					CVIS(GEO_CIX) = 1;
+					opts.wiif = 1;
 					break;
 				case 'a':
 					CVIS(ASN_CIX) = 1;
+					opts.wiif = 1;
 					break;
 				case 'p':
 					CVIS(PROXY_CIX) = 1;
+					opts.wiif = 1;
 					break;
 				case '0':
 					CVIS(GEO_CIX) = 1;
 					CVIS(PROXY_CIX) = 1;
+					opts.wiif = 1;
 					CVIS(ASN_CIX) = 1;
 					break;
 				default:
@@ -702,6 +705,9 @@ void sort(struct table * t) {
 #define IS_LADDR(a) (globals.wladdr && !in_addr_cmp((a), globals.laddr))
 #define IS_LADDR6(a) (globals.wladdr6 && !memcmp((a), &globals.laddr6, sizeof(struct in6_addr)))
 
+#define IS_RADDR(a) (globals.wladdr && in_addr_cmp((a), globals.laddr))
+#define IS_RADDR6(a) (globals.wladdr6 && memcmp((a), &globals.laddr6, sizeof(struct in6_addr)))
+
 /* determines if specified address is local on the interface and can be pretty printed */
 #define FORMAT_INADDR(a) (!opts.r && IS_LADDR(a))
 /* same as FORMAT_INADDR but for ipv6, a must be pointer to in6_addr */
@@ -722,7 +728,7 @@ static inline int groupip(struct pkt_digest * dg, int cix, struct td * row) {
 		if(isproto(dg, ID_IPV4)) {
 			if(in_addr_cmp(row[cix].in_addr_val, 
 					cix == IPSADDR_CIX ? dg->ipv4.saddr : dg->ipv4.daddr))
-				return 0;
+			return 0;
 		} else if(isproto(dg, ID_IPV6)) {
 			if(memcmp(cix == IPSADDR_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr, 
 						&row[cix].in6_addr_val, sizeof(struct in6_addr)))
@@ -748,29 +754,13 @@ static inline void setipcell(struct pkt_digest * dg, int cix, struct td * row) {
 		struct in_addr a =  cix == IPSADDR_CIX ? dg->ipv4.saddr : dg->ipv4.daddr;
 		row[cix].celltype = 0; /* return type to default - ipv4 */
 		row[cix].in_addr_val = a;
-		if(FORMAT_INADDR(a)) {
-			row[cix].adrstart = clr_local;
-			row[cix].adrend = clr_norm;
-		} else {
-			row[cix].adrstart = NULL;
-			row[cix].adrend = NULL;
-		}
 	} else if(isproto(dg, ID_IPV6)) {
 		struct in6_addr * i6 =  cix == IPSADDR_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr;
 		row[cix].celltype = CT_IN6ADDR; /* override default column typ to ipv6 */
-		row[cix].in6_addr_val = *i6;
-		if(FORMAT_IN6ADDR(i6)) {
-			row[cix].adrstart = clr_local;
-			row[cix].adrend = clr_norm;
-		} else {
-			row[cix].adrstart = NULL;
-			row[cix].adrend = NULL;
-		}
+		row[cix].in6_addr_val = *i6;	
 	} else {
 		row[cix].celltype = 0;
 		row[cix].in_addr_val.s_addr = INADDR_TEST_NET_1;
-		row[cix].adrstart = NULL;
-		row[cix].adrend = NULL;
 	}
 }
 
@@ -813,22 +803,12 @@ static inline void setportcell(struct pkt_digest * dg, int cix, struct td * row)
 	} else {
 		row[cix].uint16v = 0;
 	}
-
-	if(	( isproto(dg, ID_IPV4) && FORMAT_INADDR(cix == SRC_CIX ? dg->ipv4.saddr : dg->ipv4.daddr) ) ||
-		( isproto(dg, ID_IPV6) && FORMAT_IN6ADDR(cix == SRC_CIX ? &dg->ipv6.saddr : &dg->ipv6.daddr))
-	  ) {
-		row[cix].adrstart = clr_local;
-		row[cix].adrend = clr_norm;
-	} else {
-		row[cix].adrstart = NULL;
-		row[cix].adrend = NULL;
-	}
 }
 
 void upsert(struct table * t, struct pkt_digest * dg) {
 
 	struct td * row;
-	uint16_t i;
+	int i;
 
 	if(pthread_spin_lock(&globals.sync)) 
 		print_errno_exit(upsert:)
@@ -872,8 +852,22 @@ void upsert(struct table * t, struct pkt_digest * dg) {
 	}
 
 	if(t->rows >= t->maxrows) {
-		row = t->data[t->rows - 1];
-		t->rowspec[t->rows - 1].tainted = 1;
+		/*
+		 * if row is already tainted that means it wasn't rendered.
+		 * so we will pick higher row
+		 * */
+		i = t->rows;
+		while(--i >= 1) {
+			if(t->rowspec[i].tainted)	
+				continue;
+			row = t->data[i];
+			t->rowspec[i].tainted = 1;
+			break;
+		}
+		if(i <= 0) {
+			pkt_logf("%s: dropping packets. either buffer too small or refresh interval too big\n", __func__);
+			goto UNLOCK_END;
+		}
 	} else {
 		row = t->data[t->rows];
 		t->rows++;
@@ -978,7 +972,6 @@ void rcv_pkt(u_char * const args, const struct pcap_pkthdr * const _h, const u_c
 	upsert(&globals.t, &pkt_digest);
 }
 
-
 void cleanup()
 {
 	const char ct[] = "cleanup... ";
@@ -1006,6 +999,9 @@ void cleanup()
 		for(size_t i = 0; i < globals.ssht_len; i++)
 			free(globals.ssht[i]);
 	}
+	if(globals.iif.data) {
+		free(globals.iif.data);
+	}
 
 	pkt_log("done cleanup\n");
 
@@ -1018,15 +1014,42 @@ void cleanup()
 	exit(0);
 }
 
+int is_raddr_any(struct td * row, int cix) {
+	if(!CVIS(cix))
+		return 0;
+	
+	switch(TDTP(row, cix)) {
+	case CT_INADDR:
+		return IS_RADDR(row[cix].in_addr_val);
+	case CT_IN6ADDR:
+		return IS_RADDR6(&row[cix].in6_addr_val);
+	default:
+		pkt_logf("%s: unrecognized addr column\n", __func__);
+		return 0;
+	}
+}
 int is_laddr_any(struct td * row, int cix) {
+	if(!CVIS(cix))
+		return 0;
+	
 	switch(TDTP(row, cix)) {
 	case CT_INADDR:
 		return IS_LADDR(row[cix].in_addr_val);
 	case CT_IN6ADDR:
 		return IS_LADDR6(&row[cix].in6_addr_val);
+	default:
+		pkt_logf("%s: unrecognized addr column\n", __func__);
+		return 0;
 	}
-	return 0;
 }
+
+int format_addr_any(struct td * row, int cix) {	
+	if(opts.r)
+		return 0;
+	
+	return is_laddr_any(row, cix);
+}
+
 
 int saddr_from_td(struct td * row, int cix, int pix, 
 		struct sockaddr_in * saddr, struct sockaddr_in6 * saddr6) {
@@ -1140,6 +1163,41 @@ static struct sockstat_info * ssht_row_lookup(struct td * row) {
 	return ssht_lookup(&buf);
 }
 
+static int iif_cpy_into_cell(struct in_addr x, struct td * row, int cix) {
+
+	for(int iter = 0; iter < globals.iif.len; iter++) {
+		if(globals.iif.data[iter].a.s_addr != x.s_addr) {
+			continue;
+		}
+		switch(TDTP(row, cix)) {
+		case CT_GEO:
+			strncpy(row[cix].cstr, globals.iif.data[iter].geo, MCSZ(cix));
+			return strlen(globals.iif.data[iter].geo);
+		case CT_PROXY:
+			strncpy(row[cix].cstr, globals.iif.data[iter].proxy, MCSZ(cix));
+			return strlen(globals.iif.data[iter].proxy);
+		case CT_ASN:
+			strncpy(row[cix].cstr, globals.iif.data[iter].asn, MCSZ(cix));
+			return strlen(globals.iif.data[iter].asn);
+		default:
+			pkt_logf("%s: unrecognized column type\n", __func__);
+			return 0;
+		}
+	}
+	return 0;
+}
+
+static int iif_cpy_into_cell_any(struct td * row, int cix) {
+	if(is_raddr_any(row, IPSADDR_CIX) && TDTP(row, IPSADDR_CIX) == CT_INADDR) {
+		return iif_cpy_into_cell(row[IPSADDR_CIX].in_addr_val, row, cix);
+	} else if(is_raddr_any(row, IPDADDR_CIX) && TDTP(row, IPDADDR_CIX) == CT_INADDR) {
+		return iif_cpy_into_cell(row[IPDADDR_CIX].in_addr_val, row, cix);
+	} else {
+		strncpy(row[cix].cstr, "?", MCSZ(cix));
+		return 2;
+	}
+}
+
 /*
  * return number of written bytes	
  * */
@@ -1155,7 +1213,18 @@ static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 		celltype = CTP(j);
 	}
 
+	/* only reset adornment if we updating existing row */
+	if(t->rowspec[i].tainted) {
+		t->data[i][j].adrstart = NULL;
+		t->data[i][j].adrend = NULL;
+	}
+
 	switch(celltype) {
+	case CT_GEO:
+	case CT_PROXY:
+	case CT_ASN:
+		wrote = iif_cpy_into_cell_any(t->data[i], j);
+		break;
 	case CT_PKTSUM:
 		wrote = sprintf_proto(t->data[i][j].cstr, t->data[i][j].proto);
 		break;
@@ -1171,6 +1240,13 @@ static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 				t->data[i][j].cstr, 
 				MCSZ(IPSADDR_CIX), 
 				inet_ntoa(t->data[i][j].in_addr_val));
+			if(FORMAT_INADDR(t->data[i][j].in_addr_val)) {
+				t->data[i][j].adrstart = clr_local;
+				t->data[i][j].adrend = clr_norm;
+			} else {
+				t->data[i][j].adrstart = NULL;
+				t->data[i][j].adrend = NULL;
+			}
 		}
 		break;
 		
@@ -1184,8 +1260,26 @@ static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 		} else {
 			wrote = sprintf(t->data[i][j].cstr, "?");
 		}
-		break;
+
+		switch(j) {
+		case SRC_CIX:
+			if(format_addr_any(t->data[i], IPSADDR_CIX)) {
+				t->data[i][j].adrstart = clr_local;
+                                t->data[i][j].adrend = clr_norm;
+			}
+			break;
+		case DST_CIX:
+			if(format_addr_any(t->data[i], IPDADDR_CIX)) {
+				t->data[i][j].adrstart = clr_local;
+                                t->data[i][j].adrend = clr_norm;
+			}
+			break;
+		default:
+			pkt_logf("%s: unrecognized column for type CT_PORT\n", __func__);
+		}
 		
+		break;
+
 	case CT_TIME:
 		if(now < 1 || t->data[i][j].time < 1)
 			wrote = sprintf(t->data[i][j].cstr, "?");
@@ -1197,13 +1291,22 @@ static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 		break;
 	
 	case CT_IN6ADDR:
-		if(inet_ntop(AF_INET6, &t->data[i][j].in6_addr_val, t->data[i][j].cstr, MCSZ(j)))
+		if(inet_ntop(AF_INET6, &t->data[i][j].in6_addr_val, t->data[i][j].cstr, MCSZ(j))) {
 			wrote = strlen(t->data[i][j].cstr);
-		else
+			if(FORMAT_IN6ADDR(&t->data[i][j].in6_addr_val)) {
+				t->data[i][j].adrstart = clr_local;
+				t->data[i][j].adrend = clr_norm;
+			} else {
+				t->data[i][j].adrstart = NULL;
+				t->data[i][j].adrend = NULL;
+			}
+		} else {
 			wrote = sprintf(t->data[i][j].cstr, "!(err=%d)", errno);
+		}
 		break;
 	case CT_PINFO:
 		wrote = 0;
+		iter = 0;
 		si = ssht_row_lookup(t->data[i]);
 		if(si) {
 			strncpy(t->data[i][j].cstr, si->pinfo, SS_PINFO_SZ);
@@ -1256,13 +1359,13 @@ void printbl(struct table * t) {
 
 	time_t now = time(NULL);
 
-	for(size_t i = 0; i < t->rows; i++) {
+	for(size_t i = 1; i < t->rows; i++) {
 		for(size_t j = 0; j < t->cols; j++) {
 
 			if(!CVIS(j)) 
 				continue;
 
-			if(t->rowspec[i].tainted || !t->data[i][j].cstr[0] || (!CRDONLY(j) && i > 0)) {	
+			if(t->rowspec[i].tainted || !t->data[i][j].cstr[0] || !CRDONLY(j)) {	
 				wrote = write_into_cell_cstr(t, i, j, now) + 1;
 				if(wrote > CCSZ(j))
 					CCSZ(j) = wrote;
@@ -1270,7 +1373,6 @@ void printbl(struct table * t) {
 		}
 
 		if(t->rowspec[i].tainted)
-
 			t->rowspec[i].tainted = 0;
 	}
 
@@ -1305,7 +1407,7 @@ void printbl(struct table * t) {
 void initbl(struct table * t) {
 
 
-	int maxcap = 20;
+	int maxcap = 60;
 	/* predefined limit + 1 to account for header row */
 	t->maxrows = maxcap + 1;
 	/* 1 because of header row */
@@ -1331,6 +1433,16 @@ void initbl(struct table * t) {
 			}
 		}
 	}
+
+	if(opts.wiif) {
+		globals.iif.cap = maxcap;
+		globals.iif.len = 0;
+		int size = sizeof(*globals.iif.data) * globals.iif.cap;
+		globals.iif.data = malloc(size);
+		pkt_logf("%s allocated: %d bytes for iif array (len=%d)\n", __func__, size, globals.iif.cap);
+	}
+
+
 #if defined(DBG)
 	for(size_t j = 0; j < t->cols; j++) {
 		if(!colspec[j].visible)
@@ -1717,41 +1829,165 @@ ERR:
 
 #define CLOCK_DIF_MICRO(start, end) (1e6 * (float)((end)-(start)) / CLOCKS_PER_SEC)
 
-void * run_readloop(void * args) {
-	pkt_logf("started readloop\n");
+static inline long add_avg(float avg, int n, float v) {
+	return ((avg * n) + v) / (n + 1);
+}
 
-#if defined(DBG1)	
+static void log_iif_err(const char * const p, struct in_addr a, int r) {
+	if(r <= 0) {
+		pkt_logf("%s: %s: unable to find line for %s (res=%d)\n", __func__, p, inet_ntoa(a), r);
+	if(r == -1)
+		pkt_logf("%s: errno is '%s'\n", __func__, strerror(errno));
+	}
+}
+
+static void set_iif() {
+	struct in_info * in = globals.iif.data;
+	int len = globals.iif.len;
+	static char lb[LINE_BUF_SZ];
+	static struct db11 db;
+	static struct asn asn;
+	static struct px11 px;
+	int lbl, r;
+	static const char * db11path = "tmp/IP2LOCATION-LITE-DB11.CSV";
+	static const char * asnpath = "tmp/IP2LOCATION-LITE-ASN.CSV";
+	static const char * px11path = "tmp/IP2PROXY-LITE-PX11.CSV";
+	
+	for(int i = 0; i < len; i++) {
+		if(CVIS(GEO_CIX)){
+			lbl = sizeof(lb);
+			r = search_in(db11path, in[i].a, lb, &lbl); 
+			if(r<=0) {
+				*in[i].geo = 0;
+				log_iif_err(db11path, in[i].a, r);
+			} else {
+				if(parse_db11_line(&db, lb, lbl) == 0) {
+					/* N is not necessary since geo is always bigger than src
+					 * but just to be safe...
+					 * */
+					snprintf(in[i].geo, GEO_INFO_SZ, "%s - %s", db.country, db.city);
+				} else {
+					pkt_logf("%s: couldnt parse line\n", __func__);
+				}
+			}
+		}
+		if(CVIS(ASN_CIX)) {
+			lbl = sizeof(lb);
+			r = search_in(asnpath, in[i].a, lb, &lbl);
+			if(r <= 0) {
+				snprintf(in[i].asn, ASN_INFO_SZ, "x");
+			} else {
+				if(parse_asn_line(&asn, lb, lbl) == 0) {
+					snprintf(in[i].asn, ASN_INFO_SZ, "%s (%ld)", asn.asname, asn.asn);
+				} else {
+					pkt_logf("%s: couldnt parse line\n", __func__);	
+				}
+			}
+		}
+		if(CVIS(PROXY_CIX)) {
+			lbl = sizeof(lb);
+			r = search_in(px11path, in[i].a, lb, &lbl);
+			if(r <= 0) {
+				snprintf(in[i].proxy, PROXY_INFO_SZ, "x");
+			} else {
+				if(parse_px11_line(&px, lb, lbl) == 0) {
+					snprintf(in[i].proxy, PROXY_INFO_SZ, 
+						"T=%s %s (%s) U=%s THR=%s", 
+						px.proxy_type,
+						px.isp,
+						px.domain,
+						px.usage_type,
+						px.threat);
+				} else {
+					pkt_logf("%s: couldnt parse line\n", __func__);	
+				}
+			}
+		}
+	}
+}
+
+
+
+/*
+ * TODO: iif should be hash so this can be avoided
+ * */
+static int iif_has_in(struct in_addr in) {
+	for(int i =0 ;i < globals.iif.len; i++)
+		if(globals.iif.data[i].a.s_addr == in.s_addr)
+			return 1;
+	return 0;
+}
+
+static void * run_readloop(void * args) {
+	pkt_logf("started readloop\n");
+	float avg_ssht_t = 0, avg_print_t = 0, avg_iif_t = 0;
+	int loops = 0, i;
 	clock_t start, end;
+	const int stat_interval = 10;
+	/* display run statistics each stat_interval secs */
+	int dloops = stat_interval / opts.i;
+	if(dloops < 1)
+		dloops = 1;
+
 	for(;;) {
 		if(opts.p) {
 			start = clock();
 			set_ssht(globals.ssht, globals.ssht_len);
 			end = clock();
-			pkt_logf1("set_ssht done in %.1f μs\n", CLOCK_DIF_MICRO(start, end));
+			avg_ssht_t = add_avg(avg_ssht_t, loops, CLOCK_DIF_MICRO(start, end)); 
 		}
+		
+		if(opts.wiif) {
+			start = clock();
+			set_iif();
+			end = clock();
+			avg_iif_t = add_avg(avg_iif_t, loops, CLOCK_DIF_MICRO(start, end));
+		}
+		
 		start = clock();
+		
 		if(pthread_spin_lock(&globals.sync))
 			print_errno_exit(run_readloop:)
 		printbl(&globals.t);
-		pthread_spin_unlock(&globals.sync);
-		end = clock();
-                pkt_logf1("printbl done in %.1f μs\n", CLOCK_DIF_MICRO(start, end));
-		sleep(opts.i);
-	}
-	return NULL;
-#endif
-	
-	for(;;) {
-		if(opts.p) {
-			set_ssht(globals.ssht, globals.ssht_len);
-		}
-		if(pthread_spin_lock(&globals.sync)) 
-			print_errno_exit(run_readloop:);
-		printbl(&globals.t);
-		pthread_spin_unlock(&globals.sync);
-		sleep(opts.i);
-	}
+		
+		if(opts.wiif) {
+			/* sanity checks */
+			if(globals.iif.cap <= 0 || !globals.iif.data || globals.iif.cap != (globals.t.maxrows-1)) {
+				pkt_logf("%s: opts.wiif is set but table is not initialized\n", __func__);
+				opts.wiif = 0;
+			} else {
+				globals.iif.len = 0;
+				for(i = 1; i < globals.t.rows; i++) {
+					/* TODO: it would be much cleaner to just define functions
+					 * "ipraddr_cix" and "ipladdr_cix" and use those indexes to access columns
+					 * all of those nasty ifs would disapear
+					 * */
 
+					if(is_raddr_any(globals.t.data[i], IPSADDR_CIX) 
+							&& TDTP(globals.t.data[i], IPSADDR_CIX) == CT_INADDR) {
+						if(!iif_has_in(globals.t.data[i][IPSADDR_CIX].in_addr_val))
+							globals.iif.data[globals.iif.len++].a 
+								= globals.t.data[i][IPSADDR_CIX].in_addr_val;	
+					} else if(is_raddr_any(globals.t.data[i], IPDADDR_CIX) 
+							&& TDTP(globals.t.data[i], IPDADDR_CIX) == CT_INADDR) {
+						if(!iif_has_in(globals.t.data[i][IPDADDR_CIX].in_addr_val))
+							globals.iif.data[globals.iif.len++].a 
+								= globals.t.data[i][IPDADDR_CIX].in_addr_val;
+					}
+				}
+			}
+		}
+		
+		pthread_spin_unlock(&globals.sync);
+		
+		end = clock();
+		avg_print_t = add_avg(avg_print_t, loops, CLOCK_DIF_MICRO(start, end)); 
+		loops++;
+		if(!(loops % dloops)) {
+			pkt_logf("print=%.1f ssht=%.1f iif=%.1f\n", avg_print_t, avg_ssht_t, avg_iif_t);
+		}	
+		sleep(opts.i);
+	}
 	return NULL;
 }
 
@@ -1842,4 +2078,5 @@ int main(int argc, char *argv[]) {
 
 	cleanup();
 	return 0;
+
 }

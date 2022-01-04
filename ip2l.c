@@ -228,13 +228,12 @@ static inline int skip_to_delim(char ** s, int * len) {
 }
 
 /* apparently ip2l csvs terminate lines with crlf.
- * so this function is gonna put cursor to that char
  * */
 static inline int skip_to_end(char ** s, int * len) {
 	for(int i = 0; i < *len; i++) {
-		if((*s)[i] == '\r' && i == *len - 1) {
-			*s += i;
-			*len -= i;
+		if((*s)[i] == '\r' && i > 0 && i == *len - 1) {
+			*s += i - 1;
+			*len -= i - 1;
 			return 0;
 		}
 	}
