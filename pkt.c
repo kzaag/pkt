@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 
 #include "pkt_digest.h"
+#include "ip2l.h"
 
 static char pcaperr[PCAP_ERRBUF_SIZE];
 
@@ -149,6 +150,16 @@ struct sockstat_info {
 	uint64_t _hash;
 };
 
+#define GEO_INFO_SZ  40
+#define PROXY_INFO_SZ 80
+#define ASN_INFO_SZ  40
+struct in_info {
+	struct in_addr a;
+	char geo[GEO_INFO_SZ];
+	char proxy[PROXY_INFO_SZ];
+	char asn[ASN_INFO_SZ];
+};
+
 
 /* indexes for specified columns within colspec */
 #define SUMMARY_CIX   0
@@ -165,6 +176,9 @@ struct sockstat_info {
 #define SIZE_CIX  (CIX_FACT_START+1)
 #define TIME_CIX  (CIX_FACT_START+2)
 #define PINFO_CIX (CIX_FACT_START+3)
+#define GEO_CIX   (CIX_FACT_START+4)
+#define ASN_CIX   (CIX_FACT_START+5)
+#define PROXY_CIX (CIX_FACT_START+6)
 
 /* column type (CT_) represents which union field present under 'struct td' will be used to determine cell cstr 
 */
@@ -186,8 +200,11 @@ struct sockstat_info {
 /* uses .in6_addr_val, formats output to IPv6 CIDR */
 #define CT_IN6ADDR 6
 
-/* no backing field, stored process info */
-#define CT_PINFO 7
+#define CT_PINFO 7 /* stored process info */
+#define CT_GEO   8
+#define CT_ASN   9
+#define CT_PROXY 10
+
 
 typedef u_char celltype_t;
 
@@ -221,7 +238,6 @@ struct colspec {
 	   */
 	u_char readonly : 1;
 } colspec [] = {
-	/* dims - not visible by default */
 	{
 		.hdr = "SUM",
 		.c_size = 4,
@@ -269,7 +285,6 @@ struct colspec {
 		.visible = 0,
 		.readonly = 1,
 	},
-	/* facts - visible by default */
 	{
 		.hdr = "COUNT",
 		.c_size = 6,
@@ -303,6 +318,30 @@ struct colspec {
 	 	.coltype = CT_PINFO,
        		.visible = 0,
 	 	.readonly = 0	
+	},
+	{
+		.hdr = "GEO",
+		.c_size = 4,
+		.max_size = GEO_INFO_SZ,
+	       	.coltype = CT_GEO,
+ 		.visible = 0,
+		.readonly = 1 /* it is *unlikely* that geo info will change during single session */		
+	},
+	{
+		.hdr = "ASN",
+		.c_size = 4,
+		.max_size = ASN_INFO_SZ,
+		.coltype = CT_ASN,
+		.visible = 0,
+		.readonly = 1
+	}, 
+	{
+		.hdr = "PROXY",
+		.c_size = 6,
+		.max_size = PROXY_INFO_SZ,
+		.coltype = CT_PROXY,
+		.visible = 0,
+		.readonly = 1
 	}
 };
 
@@ -422,7 +461,7 @@ int init_opts(int argc, char * argv[])
 	size_t i = 0;
 	char spec = 0;
 
-	while((o = getopt(argc, argv, "p46l:d:g:n:")) != -1) {
+	while((o = getopt(argc, argv, "i:p46l:d:g:n:")) != -1) {
 		switch(o) {
 		case 'd':
 			opts.d = strdup(optarg);
@@ -451,6 +490,7 @@ int init_opts(int argc, char * argv[])
 			}
 			break;
 		case 'g':
+			i = 0;
 			for(;;) {
 				if(!optarg[i]) 
 					break;
@@ -470,6 +510,13 @@ int init_opts(int argc, char * argv[])
 				case 'v':
 					CVIS(DST_CIX) = 1;
 					break;
+				case '0':
+					CVIS(SUMMARY_CIX) = 1;
+					CVIS(IPSADDR_CIX) = 1;
+					CVIS(IPDADDR_CIX) = 1;
+					CVIS(SRC_CIX) = 1;
+					CVIS(DST_CIX) = 1;
+					break;
 				default:
 					fprintf(stderr, "%s: unkown group option -- %c\n", argv[0], optarg[i]);
 					exit(1);
@@ -487,6 +534,34 @@ int init_opts(int argc, char * argv[])
 		case 'p':
 			opts.p = 1;
 			CVIS(PINFO_CIX) = 1;
+			break;
+		case 'i':
+			i = 0;
+			for(;;) {
+				if(!optarg[i]) {
+					break;
+				}
+				switch(optarg[i]) {
+				case 'g':
+					CVIS(GEO_CIX) = 1;
+					break;
+				case 'a':
+					CVIS(ASN_CIX) = 1;
+					break;
+				case 'p':
+					CVIS(PROXY_CIX) = 1;
+					break;
+				case '0':
+					CVIS(GEO_CIX) = 1;
+					CVIS(PROXY_CIX) = 1;
+					CVIS(ASN_CIX) = 1;
+					break;
+				default:
+					fprintf(stderr, "%s: unkown inet info option -- %c\n", argv[0], optarg[i]);
+					exit(1);
+				}
+				i++;
+			}
 			break;
 		default:
 			exit(1);
