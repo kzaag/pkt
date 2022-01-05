@@ -894,7 +894,6 @@ static void upsert(struct table * t, struct pkt_digest * dg) {
 
 	if(CVIS(SUMMARY_CIX)) {
 		row[SUMMARY_CIX].proto = dg->meta.proto_flags;
-
 	}
 
 	if(CVIS(TIME_CIX)) {
@@ -1273,8 +1272,10 @@ static struct in_info * lookup_iif(struct in_addr a) {
 
 static int iif_cpy_into_cell(struct in_addr x, struct td * row, int cix) {
 	struct in_info * l = lookup_iif(x);
-	if(!l || !l->c)
+	if(!l || !l->c) {
+		*row[cix].cstr = 0;
 		return 0;
+	}
 
 	switch(TDTP(row, cix)) {
 	case CT_GEO:
