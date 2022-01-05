@@ -1562,8 +1562,6 @@ void initbl(struct table * t) {
 
 static inline int is_white_char(char c) {
 	switch(c) {
-	case '\n':
-		return 1;
 	case '\t':
 		return 1;
 	case ' ': 
@@ -1572,17 +1570,19 @@ static inline int is_white_char(char c) {
 	return 0;
 }
 
-char * skip_white_chars(char * buf, int r) {
+#define SKIP_TO 1
+#define LF_IS_WHITE_CHAR 2
+char * skip_white_chars(char * buf, int flags) {
 	if(!buf || !*buf)
 		return NULL;
 	while(*buf) {
-		if(is_white_char(*buf)) {
-			if(r)
+		if(((flags&LF_IS_WHITE_CHAR) && *buf=='\n') || is_white_char(*buf)) {
+			if(flags & SKIP_TO)
 				return buf;
 			else
 				buf++;
 		} else {
-			if(r)
+			if(flags & SKIP_TO)
 				buf++;
 			else
 				return buf;
@@ -1673,84 +1673,86 @@ static int parse_ss_saddr(char * start, char * end, void * dst, struct sockstat_
  * */
 static char * parse_ss_line(char * buf, struct sockstat_info * i) {
 	char * s;
-	int mode = 0;
+	int state = 0;
 	
-	/*must at least contain null terminator (with sizeof = 1) */
-	static const char overflow_term[] = "...";
 	static const char skip_pinfo_pref[] = "users:";
 
 	while(*buf) {
 		if(!(buf = skip_white_chars(buf, 0)))
 			return NULL;
-		s = buf;
-		/* flag '1' means that we skip TO white char */
-		if(!(buf = skip_white_chars(buf, 1)))
+
+		if(*buf == '\n') {
+			if(state == 6) {
+				strncpy(i->pinfo, "x", SS_PINFO_SZ);
+				return buf + 1;
+			}
 			return NULL;
-		switch(mode) {
-			/* Netid*/
-			case 0:
-				if((buf - s) != 3)
-					return NULL;
-				/* zero the proto on first use */
-				i->proto = 0;
-				if(!memcmp(s, "tcp", 3)) {
-					i->proto |= IDF(ID_TCP);
-				} else if(!memcmp(s, "udp", 3)) {
-					i->proto |= IDF(ID_UDP);	
-				} else {
-					return NULL;
-				}
-				mode++;
-				break;		
-			/* State */
-			case 1:
-				mode++;
-				break;
-			/* recv-q */
-			case 2:
-				mode++;
-				break;
-			/* send-q */
-			case 3:
-				mode++;
-				break;
-			/* laddr:port */
-			case 4:	
-				if(!parse_ss_saddr(s, buf, &i->lsaddr, i))
-					return NULL;
-				mode++;
-				break;
-			/* paddr:port */
-			case 5:
-				if(!parse_ss_saddr(s, buf, &i->psaddr, i))
-					return NULL;
-				mode++;
-				break;
-			/* psum */
-			case 6:
-				if(buf-s > sizeof(skip_pinfo_pref)-1) {
-					if(!memcmp(s, skip_pinfo_pref, sizeof(skip_pinfo_pref)-1))
-						s+=sizeof(skip_pinfo_pref)-1;
-				}
-				if(buf-s >= SS_PINFO_SZ) {	
-					memcpy(i->pinfo, s, SS_PINFO_SZ-sizeof(overflow_term));
-					memcpy(i->pinfo+SS_PINFO_SZ-sizeof(overflow_term), 
-							overflow_term, sizeof(overflow_term));
-					/* i->pinfo[SS_PINFO_SZ-1] = 0; */
-				} else {
-					memcpy(i->pinfo, s, buf-s);
-					i->pinfo[buf-s] = 0;
-				}
-				buf = skip_white_chars(buf, 0);
-				/* if next line exists then return it */
-				if(buf)
-					return buf;
-				/* otherwise return end of string */
-				s += strlen(s);
-				return s;
-			default:
-				return NULL;
 		}
+
+		s = buf;
+
+		if(!(buf = skip_white_chars(buf, SKIP_TO | LF_IS_WHITE_CHAR))) {	
+			return NULL;
+		}
+
+		switch(state) {
+		/* Netid */
+		case 0:
+			if((buf - s) != 3)
+				return NULL;
+			/* zero the proto on first use */
+			i->proto = 0;
+			if(!memcmp(s, "tcp", 3)) {
+				i->proto |= IDF(ID_TCP);
+			} else if(!memcmp(s, "udp", 3)) {
+				i->proto |= IDF(ID_UDP);	
+			} else {
+				return NULL;
+			}
+			break;		
+		/* State */
+		case 1:
+			break;
+		/* recv-q */
+		case 2:
+			break;
+		/* send-q */
+		case 3:
+			break;
+		/* laddr:port */
+		case 4:	
+			if(!parse_ss_saddr(s, buf, &i->lsaddr, i))
+				return NULL;
+			break;
+		/* paddr:port */
+		case 5:
+			if(!parse_ss_saddr(s, buf, &i->psaddr, i))
+				return NULL;
+			break;
+		/* psum */
+		case 6:
+			if(buf-s > sizeof(skip_pinfo_pref)-1) {
+				if(!memcmp(s, skip_pinfo_pref, sizeof(skip_pinfo_pref)-1))
+					s+=sizeof(skip_pinfo_pref)-1;
+			}
+			if(buf-s >= SS_PINFO_SZ) {	
+				memcpy(i->pinfo, s, SS_PINFO_SZ);
+			} else {
+				memcpy(i->pinfo, s, buf-s);
+				i->pinfo[buf-s] = 0;
+			}
+
+			if(!(buf = skip_white_chars(buf, 0)))
+				return NULL;
+
+			if(*buf == '\n')
+				return buf+1;
+
+			return NULL;
+		default:
+			return NULL;
+		}
+		state++;
 	}
 	return NULL;	
 }
@@ -1881,7 +1883,7 @@ void set_ssht() {
 
 		pptr = pistr;
 	
-		for(;;) {
+		for(;;) {	
 			parsed = parse_ss_line(pptr, &li);
 			if(!parsed) {
 				if(pptr == pistr) {
@@ -1897,8 +1899,8 @@ void set_ssht() {
 				}
 				memcpy(pistr, pptr, off);
 				break;
-			}
-			
+			}		
+
 			if(!insert_ssht(&li)) {
 				pkt_logf("%s: couldn't insert ss info into ssht\n", __func__);
 				goto ERR;
@@ -1913,13 +1915,17 @@ void set_ssht() {
 	}
 
 #if defined(DBG1)
-	for(int i = 0; i < ssht_len; i++) {
-		if(!ssht[i])
+	int cn = 0;
+	for(int i = 0; i < globals.ssht_len; i++) {
+		if(!globals.ssht[i])
 			continue;
-		if(!ssht_lookup(ssht[i])) {
+		if(!ssht_lookup(globals.ssht[i])) {
 			pkt_logf("%s: couldn't perform lookup for existing element\n", __func__);
 		}
+		pkt_logf("%s: pinfo=%s\n", __func__, globals.ssht[i]->pinfo);
+		cn++;
 	}
+	pkt_logf("%s: count=%d\n", __func__, cn);
 #endif
 
 	if(close_pipe)
@@ -1974,7 +1980,7 @@ static void set_iif() {
 			}
 		}
 
-		*tbl[i].c->asn = 0;
+		strncpy(tbl[i].c->asn, "?", ASN_INFO_SZ);
 		if(CVIS(ASN_CIX)) {
 			lbl = sizeof(lb);
 			r = search_in(asnpath, tbl[i].a, lb, &lbl);
@@ -1987,7 +1993,7 @@ static void set_iif() {
 			}
 		}
 
-		*tbl[i].c->proxy = 0;
+		strncpy(tbl[i].c->proxy, "?", PROXY_INFO_SZ);
 		if(CVIS(PROXY_CIX)) {
 			lbl = sizeof(lb);
 			r = search_in(px11path, tbl[i].a, lb, &lbl);
@@ -2013,7 +2019,7 @@ static void * run_readloop(void * args) {
 	float avg_ssht_t = 0, avg_print_t = 0, avg_iif_t = 0;
 	int loops = 0, i;
 	clock_t start, end;
-	const int stat_interval = 10;
+	const int stat_interval = 60;
 	/* display run statistics each stat_interval secs */
 	int dloops = stat_interval / opts.i;
 	if(dloops < 1)
