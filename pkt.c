@@ -151,12 +151,12 @@ struct sockstat_info {
 };
 
 
-#define GEO_INFO_SZ  (COUNTRY_SIZE + 3 + CITY_SIZE + 1)
 #define PROXY_INFO_SZ (2 + PROXY_TYPE_SIZE + 2 + ISP_SIZE + 4 + DOMAIN_SIZE + 4 + USAGE_TYPE_SIZE + 5 + THREAT_SIZE)
 #define ASN_INFO_SZ  (10 + 3 + ASNAME_SIZE)
 
 struct in_info_c {
-	char geo[GEO_INFO_SZ];
+	char country[COUNTRY_SIZE];
+	char city[CITY_SIZE];
 	char proxy[PROXY_INFO_SZ];
 	char asn[ASN_INFO_SZ];	
 };
@@ -182,9 +182,12 @@ struct in_info {
 #define SIZE_CIX  (CIX_FACT_START+1)
 #define TIME_CIX  (CIX_FACT_START+2)
 #define PINFO_CIX (CIX_FACT_START+3)
-#define GEO_CIX   (CIX_FACT_START+4)
-#define ASN_CIX   (CIX_FACT_START+5)
-#define PROXY_CIX (CIX_FACT_START+6)
+
+#define COUNTRY_CIX   (CIX_FACT_START+4)
+#define CITY_CIX      (CIX_FACT_START+5)
+
+#define ASN_CIX   (CIX_FACT_START+6)
+#define PROXY_CIX (CIX_FACT_START+7)
 
 /* column type (CT_) represents which union field present under 'struct td' will be used to determine cell cstr 
 */
@@ -207,9 +210,13 @@ struct in_info {
 #define CT_IN6ADDR 6
 
 #define CT_PINFO 7 /* stored process info */
-#define CT_GEO   8
-#define CT_ASN   9
-#define CT_PROXY 10
+
+/* this is taken from geo csv */
+#define CT_COUNTRY 8
+#define CT_CITY    9
+
+#define CT_ASN   10
+#define CT_PROXY 11
 
 
 typedef u_char celltype_t;
@@ -326,16 +333,24 @@ struct colspec {
 	 	.readonly = 0	
 	},
 	{
-		.hdr = "GEO",
-		.c_size = 4,
-		.max_size = GEO_INFO_SZ,
-	       	.coltype = CT_GEO,
+		.hdr = "COUNTRY",
+		.c_size = 8,
+		.max_size = COUNTRY_SIZE,
+	       	.coltype = CT_COUNTRY,
  		.visible = 0,
-		.readonly = 1 /* it is *unlikely* that geo info will change during single session */		
+		.readonly = 1
 	},
 	{
-		.hdr = "ASN",
-		.c_size = 4,
+		.hdr = "CITY",
+		.c_size = 5,
+		.max_size = CITY_SIZE,
+		.coltype = CT_CITY,
+		.visible = 0,
+		.readonly = 1
+	},
+	{
+		.hdr = "AS (ASN)",
+		.c_size = 9,
 		.max_size = ASN_INFO_SZ,
 		.coltype = CT_ASN,
 		.visible = 0,
@@ -550,7 +565,8 @@ int init_opts(int argc, char * argv[])
 				}
 				switch(optarg[i]) {
 				case 'g':
-					CVIS(GEO_CIX) = 1;
+					CVIS(COUNTRY_CIX) = 1;
+					CVIS(CITY_CIX) = 1;
 					opts.wiif = 1;
 					break;
 				case 'a':
@@ -562,7 +578,8 @@ int init_opts(int argc, char * argv[])
 					opts.wiif = 1;
 					break;
 				case '0':
-					CVIS(GEO_CIX) = 1;
+					CVIS(COUNTRY_CIX) = 1;
+					CVIS(CITY_CIX) = 1;
 					CVIS(PROXY_CIX) = 1;
 					opts.wiif = 1;
 					CVIS(ASN_CIX) = 1;
@@ -1278,9 +1295,12 @@ static int iif_cpy_into_cell(struct in_addr x, struct td * row, int cix) {
 	}
 
 	switch(TDTP(row, cix)) {
-	case CT_GEO:
-		strncpy(row[cix].cstr, l->c->geo, MCSZ(cix));
-		return strlen(l->c->geo);
+	case CT_COUNTRY:
+		strncpy(row[cix].cstr, l->c->country, MCSZ(cix));
+		return strlen(l->c->country);
+	case CT_CITY:
+		strncpy(row[cix].cstr, l->c->city, MCSZ(cix));
+		return strlen(l->c->city);
 	case CT_PROXY:
 		strncpy(row[cix].cstr, l->c->proxy, MCSZ(cix));
 		return strlen(l->c->proxy);
@@ -1327,7 +1347,8 @@ static int write_into_cell_cstr(struct table * t, int i, int j, time_t now) {
 	}
 
 	switch(celltype) {
-	case CT_GEO:
+	case CT_COUNTRY:
+	case CT_CITY:
 	case CT_PROXY:
 	case CT_ASN:
 		wrote = iif_cpy_into_cell_any(t->data[i], j);
@@ -1963,8 +1984,9 @@ static void set_iif() {
 			continue;
 		tbl[i].c = malloc(sizeof(*tbl[i].c));
 		
-		*tbl[i].c->geo = 0; 
-		if(CVIS(GEO_CIX)){
+		strncpy(tbl[i].c->country, "?", COUNTRY_SIZE);
+		strncpy(tbl[i].c->city, "?", CITY_SIZE);
+		if(CVIS(COUNTRY_CIX) && CVIS(CITY_CIX)){
 			lbl = sizeof(lb);
 			r = search_in(db11path, tbl[i].a, lb, &lbl); 
 			if(r<=0) {
@@ -1974,7 +1996,8 @@ static void set_iif() {
 					/* N is not necessary since geo is always bigger than src
 					 * but just to be safe...
 					 * */
-					snprintf(tbl[i].c->geo, GEO_INFO_SZ, "%s - %s", db.country, db.city);
+					strncpy(tbl[i].c->country, db.country, COUNTRY_SIZE);
+					strncpy(tbl[i].c->city, db.city, CITY_SIZE);
 				} else {
 					pkt_logf("%s: couldnt parse line\n", __func__);
 				}
