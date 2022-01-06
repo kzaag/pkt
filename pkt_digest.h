@@ -34,7 +34,7 @@ typedef uint16_t proto_t;
 
 #define IDF(ID) (1<<(ID))
 
-#define MAX_PROTO_LEN 10
+#define MAX_PROTO_LEN 6
 
 struct pkt_digest;
 

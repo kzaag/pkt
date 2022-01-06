@@ -13,6 +13,7 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include <sys/ioctl.h>
 
 #include "pkt_digest.h"
 #include "ip2l.h"
@@ -150,8 +151,9 @@ struct sockstat_info {
 	uint64_t _hash;
 };
 
-
-#define PROXY_INFO_SZ (2 + PROXY_TYPE_SIZE + 2 + ISP_SIZE + 4 + DOMAIN_SIZE + 4 + USAGE_TYPE_SIZE + 5 + THREAT_SIZE)
+#define PROXY_INFO_FMT "T=%s %s U=%s THR=%s"
+#define PROXY_INFO_SZ (2 + PROXY_TYPE_SIZE + 1 + ISP_SIZE + \
+		3 + USAGE_TYPE_SIZE + 5 + THREAT_SIZE)
 #define ASN_INFO_SZ  (10 + 3 + ASNAME_SIZE)
 
 struct in_info_c {
@@ -264,7 +266,7 @@ struct colspec {
 		.hdr = "IPSADDR",
 		.c_size = 11,
 		/* ipv4/v6 */
-		.max_size = 61,
+		.max_size = 46,
 		/* by default ipv4 */
 		.coltype = CT_INADDR,
 		.visible = 0,
@@ -274,7 +276,7 @@ struct colspec {
 		.hdr = "IPDADDR",
 		.c_size = 11,
 		/* ipv4/v6 */
-		.max_size = 61,
+		.max_size = 46,
 		/* by default ipv4 */
 		.coltype = CT_INADDR,
 		.visible = 0,
@@ -1534,8 +1536,28 @@ void printbl(struct table * t) {
 
 void initbl(struct table * t) {
 
+	struct winsize w;
+	if(ioctl(0, TIOCGWINSZ, &w) == -1)
+		print_errno_exit(ioctl:);
 
-	int maxcap = 60;
+	int sz = 0;
+	for(int i = 0; i < (sizeof(colspec)/sizeof(struct colspec)); i++) {
+		if(!colspec[i].visible)
+			continue;
+		sz += colspec[i].max_size + 1;
+	}
+
+	if(w.ws_row < 2) {
+		fprintf(stderr, "%s: not enough rows in tty to print table\n", __func__);	
+		exit(1);
+	}
+
+	if(w.ws_col < sz) {
+		pkt_logf("%s: warn: tty has %d columns, but table may grow to %d."
+				" Output may be truncated\n", __func__, w.ws_col, sz);
+	}
+
+	int maxcap = w.ws_row - 2;
 	/* predefined limit + 1 to account for header row */
 	t->maxrows = maxcap + 1;
 	/* 1 because of header row */
@@ -2024,10 +2046,9 @@ static void set_iif() {
 			if(r > 0) {
 				if(parse_px11_line(&px, lb, lbl) == 0) {
 					snprintf(tbl[i].c->proxy, PROXY_INFO_SZ, 
-						"T=%s %s (%s) U=%s THR=%s", 
+						PROXY_INFO_FMT, 
 						px.proxy_type,
 						px.isp,
-						px.domain,
 						px.usage_type,
 						px.threat);
 				} else {
@@ -2144,6 +2165,15 @@ int main(int argc, char *argv[]) {
 	if(globals.wladdr6)
 		pkt_logf_laddr6();
 
+	initbl(&globals.t);
+	
+	tclean();
+	tsetnowrap();
+	tgotoxy(0,0);
+
+	if(opts.p)
+		init_ssht();
+
 	if (!(globals.pcap_handle = pcap_create(opts.d, pcaperr)))
 		print_pcap_err_ret(pcap_create:)
 
@@ -2168,22 +2198,12 @@ int main(int argc, char *argv[]) {
 		print_errno_ret(pcap_activate:)
 
 	globals.dlt = pcap_datalink(globals.pcap_handle);
-
-	tclean();
-	tsetnowrap();
-	tgotoxy(0,0);
-
-	signal(SIGINT, cleanup);
-
-	initbl(&globals.t);
-
-	if(opts.p)
-		init_ssht();
-
 	pthread_spin_init(&globals.sync, 0);
 	
 	if(pthread_create(&globals.rthr, NULL, run_readloop, NULL)) 
 		print_errno_ret(pthread_create:)
+	
+	signal(SIGINT, cleanup);
 	
 	pkt_logf("starting pcap_loop\n");
 

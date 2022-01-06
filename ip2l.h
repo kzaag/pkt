@@ -17,8 +17,8 @@
  * */
 int search_in(const char * fpath, struct in_addr x, char * lb, int * lb_len);
 
-#define COUNTRY_SIZE 16
-#define CITY_SIZE 16
+#define COUNTRY_SIZE 12
+#define CITY_SIZE 12
 
 #define __ADDRPAIR \
 	struct in_addr start; \
