@@ -79,6 +79,7 @@ static void pkt_logf(const char * _fmt, ...) {
 		logbuffer[tw-1] = '\n';
 	}
 	write(dfd, logbuffer, tw);
+	va_end(args);
 }
 
 
