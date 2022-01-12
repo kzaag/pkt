@@ -982,6 +982,9 @@ static void rcv_pkt(u_char * const args, const struct pcap_pkthdr * const _h, co
 		case DLT_LINUX_SLL:
 			pkt_digest.meta.nexthop = rcv_dlt_linux_sll;
 			break;
+		case DLT_RAW:
+			pkt_digest.meta.nexthop = rcv_dlt_ip_raw;
+			break;
 	}
 
 	pkt_digest.meta.proto_flags = 0;
@@ -2201,6 +2204,8 @@ int main(int argc, char *argv[]) {
 	globals.dlt = pcap_datalink(globals.pcap_handle);
 	pthread_spin_init(&globals.sync, 0);
 	
+	pkt_logf("dlt: %d\n", globals.dlt);
+
 	if(pthread_create(&globals.rthr, NULL, run_readloop, NULL)) 
 		print_errno_ret(pthread_create:)
 	

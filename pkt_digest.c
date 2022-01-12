@@ -226,6 +226,27 @@ void rcv_dlt_en10mb(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) 
     i->meta.nexthop = switch_ethertype(i->en10mb.ethertype);
 }
 
+void rcv_dlt_ip_raw(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
+	if(*plen < sizeof(struct iphdr)) {	
+		set_pkt_meta(&i->meta, ID_IPV4);
+		set_pkt_meta(&i->meta, ID_PROTO_ETERM);
+		return;
+	}
+	struct iphdr * h = (struct iphdr *)*p;
+
+	switch(h->version) {
+	case 4:
+		i->meta.nexthop = rcv_ipv4;
+		break;
+	case 6:
+		i->meta.nexthop = rcv_ipv6;
+		break;
+	default:
+		set_pkt_meta(&i->meta, ID_IPV4);
+		set_pkt_meta(&i->meta, ID_PROTO_UNKOWN);
+	}
+}
+
 struct linux_sllhdr {
    u_int16_t pkt_type;
    u_int16_t arphrd;

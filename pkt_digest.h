@@ -123,5 +123,6 @@ int sprintf_proto(char * s, proto_t t);
 
 void rcv_dlt_en10mb(const u_char ** p, u_int32_t * plen, struct pkt_digest * i);
 void rcv_dlt_linux_sll(const u_char ** p, u_int32_t * plen, struct pkt_digest * i);
+void rcv_dlt_ip_raw(const u_char ** p, u_int32_t * plen, struct pkt_digest * i);
 
 #endif
