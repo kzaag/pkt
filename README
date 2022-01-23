@@ -1,0 +1,35 @@
+1. build binary and output it into ./bin/pkt:
+  make
+  make build
+
+2. build binary (1) but with additional logging to ./bin/out:
+  make GCC_OPTS="-D DBG"
+
+3. prerequisites for using IP geolocation, AS and PROXY ID
+   obtain ip2db csvs from https://lite.ip2location.com:
+     IP2LOCATION-LITE-DB11.CSV
+     IP2LOCATION-LITE-ASN.CSV
+     IP2LOCATION-LITE-PX11.CSV
+   create tmpfs for better perf: (from project root)
+     mkdir -p bin/tmp && mount -t tmpfs -o size=2G ip2db_tmpfs ./bin/tmp
+   place downloaded csvs into create bin/tmp dir
+   
+   
+4. running.
+     ./pkt -g0 -dppp0 -p -i0
+   opts:
+     -g 0     = group by all columns. same as: -gszxcv
+     -g szxcv = grouping options
+                -s = packet summary
+                -z = source IP4/6
+                -x = dst IP4/6
+                -c = source udp/tcp port
+                -v = dst udp/tcp port
+     -dppp0   = replace it with device on which you want to listen. for example:
+                   -deth0 -dlo -dtun0 -dwlan0
+     -p       = use ss and try to identify process associated with socket
+     -i0      = use IP2LDB (see 3) to obtain ip geo, asn, and proxy info.
+                same as -igap ([g]eo [a]sn [p]roxy)
+    
+   
+   
