@@ -12,7 +12,7 @@
      IP2LOCATION-LITE-PX11.CSV
    create tmpfs for better perf (or not, and rely on page cache)
      mkdir -p bin/tmp && mount -t tmpfs -o size=2G ip2db_tmpfs ./bin/tmp
-   place downloaded csvs into create bin/tmp dir
+   place downloaded csvs into bin/tmp dir
    
    
 4. running.
@@ -26,7 +26,7 @@
                 -c = source udp/tcp port
                 -v = dst udp/tcp port
      -dppp0   = replace it with device on which you want to listen. for example:
-                   -deth0 -dlo -dtun0 -dwlan0
+                   -deth0 or -dlo or -dtun0 or -dwlan0
      -p       = use ss and try to identify process associated with socket
      -i0      = use IP2LDB (see 3) to obtain ip geo, asn, and proxy info.
                 same as -igap ([g]eo [a]sn [p]roxy)
