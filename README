@@ -10,7 +10,7 @@
      IP2LOCATION-LITE-DB11.CSV
      IP2LOCATION-LITE-ASN.CSV
      IP2LOCATION-LITE-PX11.CSV
-   create tmpfs for better perf: (from project root)
+   create tmpfs for better perf (or not, and rely on page cache)
      mkdir -p bin/tmp && mount -t tmpfs -o size=2G ip2db_tmpfs ./bin/tmp
    place downloaded csvs into create bin/tmp dir
    

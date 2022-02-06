@@ -1221,7 +1221,8 @@ static void insert_iif(struct in_addr a, struct in_info * i) {
 		pkt_logf("%s: tried to insert 0-address\n", __func__);
 		return;
 	}
-	for(;;) {
+
+	for(;;) {	
 		e = &t[hash];
 		if(e->a.s_addr == 0) {
 			if(i) {
@@ -1245,28 +1246,38 @@ static void insert_iif(struct in_addr a, struct in_info * i) {
 			resize_iif();
 			hash = iif_hash(a);
 			sh = hash;
+			/* resize_iif may realloc lookup_table */
+			t = globals.iif.lookup_table;
 		}
 	}
 }
 
 static void resize_iif() {
 	struct in_info * t = globals.iif.lookup_table;
-	int tl = globals.iif.cap;
-	int sz = tl * sizeof(*t);
-	pkt_logf("%s: lookup_table full. reallocating another %d bytes",
+	int sz = globals.iif.cap * sizeof(*t), i;
+
+	pkt_logf("%s: lookup_table full. allocating another %d bytes\n",
 			__func__, sz);
 	t = realloc(t, 2*sz);
 	struct in_info * cpy = malloc(sz);
 	memcpy(cpy, t, sz);
-	for(int i = 0; i < 2*sz; i++) {
+
+	sz /= sizeof(*t);
+
+	for(i = 0; i < 2*sz; i++) {
 		t[i].a.s_addr = 0;
 		t[i].c = NULL;
 	}
+
 	globals.iif.lookup_table = t;
-	globals.iif.cap = sz;
-	for(int i = 0; i < sz; i++) {
+	globals.iif.cap = 2 * sz;
+	
+	for(i = 0 ; i < 2 * sz; i++)
+		globals.iif.lookup_table[i].c =NULL;
+
+	for(i = 0; i < sz; i++) {
 		if(cpy[i].a.s_addr == 0) {
-			pkt_logf("%s: during recomputation of hashes found a hole. was resize necessary?",
+			pkt_logf("%s: during recomputation of hashes found a hole. was resize necessary?\n",
 					__func__);
 			continue;
 		}
