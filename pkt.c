@@ -469,7 +469,7 @@ static struct globals {
 	int dlt;
 	struct table t;
 	pthread_t rthr;
-	pthread_spinlock_t sync;
+	pthread_mutex_t sync;
 
 	struct sockstat_info ** ssht;
 	int ssht_len;
@@ -835,7 +835,7 @@ static void upsert(struct table * t, struct pkt_digest * dg) {
 	struct td * row;
 	int i;
 
-	if(pthread_spin_lock(&globals.sync)) 
+	if(pthread_mutex_lock(&globals.sync)) 
 		print_errno_exit(upsert:)
 
 	for(i = 1; i < t->rows; i++) {
@@ -921,7 +921,7 @@ static void upsert(struct table * t, struct pkt_digest * dg) {
 	}
 
 UNLOCK_END:
-	pthread_spin_unlock(&globals.sync);
+	pthread_mutex_unlock(&globals.sync);
 
 }
 
@@ -1010,7 +1010,7 @@ static void cleanup()
 		pcap_breakloop(globals.pcap_handle);
 		pcap_close(globals.pcap_handle);
 	}
-	pthread_spin_destroy(&globals.sync);
+	pthread_mutex_destroy(&globals.sync);
 	if(globals.t.data) {
 		for(size_t i = 0; i < globals.t.maxrows; i++) {
 			for(size_t j = 0; j < globals.t.cols; j++) {
@@ -2112,7 +2112,7 @@ static void * run_readloop(void * args) {
 		
 		start = clock();
 		
-		if(pthread_spin_lock(&globals.sync))
+		if(pthread_mutex_lock(&globals.sync))
 			print_errno_exit(run_readloop:)
 		printbl(&globals.t);
 		
@@ -2128,7 +2128,7 @@ static void * run_readloop(void * args) {
 			}
 		}
 		
-		pthread_spin_unlock(&globals.sync);
+		pthread_mutex_unlock(&globals.sync);
 		
 		end = clock();
 		avg_print_t = add_avg(avg_print_t, loops, CLOCK_DIF_MICRO(start, end)); 
@@ -2213,7 +2213,7 @@ int main(int argc, char *argv[]) {
 		print_errno_ret(pcap_activate:)
 
 	globals.dlt = pcap_datalink(globals.pcap_handle);
-	pthread_spin_init(&globals.sync, 0);
+	pthread_mutex_init(&globals.sync, 0);
 	
 	pkt_logf("dlt: %d\n", globals.dlt);
 

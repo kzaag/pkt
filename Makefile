@@ -3,6 +3,9 @@ GCC_OPTS=
 
 STD_FLAGS=-Wall -Wpedantic
 
+dbg:
+	$(MAKE) GCC_OPTS="-D DBG -g -fsanitize=address" build
+
 # GCC_OPTS="-D DBG" Will enable logging to file, additionally "-D DBG1" will enable extra verbose logging
 build:
 	@mkdir -p bin
