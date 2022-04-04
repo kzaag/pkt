@@ -156,7 +156,7 @@ static inline pktcallback switch_on_ppp_dll_proto(uint16_t tt) {
 void rcv_ppp_ses(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
     set_pkt_meta(&i->meta, ID_PPPSES);
 
-    if(*plen < sizeof(struct pppoe_hdr)) {
+    if(*plen < (sizeof(struct pppoe_hdr) + sizeof(struct pppoe_tag))) {
         set_pkt_meta(&i->meta, ID_PROTO_ETERM);
         return;
     }
@@ -164,11 +164,11 @@ void rcv_ppp_ses(const u_char ** p, u_int32_t * plen, struct pkt_digest * i) {
     struct pppoe_hdr * hdr = (struct pppoe_hdr *)*p;
 
     /* ppp session should have code set to 0 = session data */
-    if(hdr->code != 0 || !hdr->tag) {
+    if(hdr->code != 0) {
         set_pkt_meta(&i->meta, ID_PROTO_UNKOWN);
         return;
     }
-
+ 
     uint16_t t = ntohs(hdr->tag->tag_type);
 
     *p += PPPOE_SES_HLEN;

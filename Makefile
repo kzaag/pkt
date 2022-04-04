@@ -1,7 +1,10 @@
 
+
 GCC_OPTS=
 
 STD_FLAGS=-Wall -Wpedantic
+
+default: build
 
 dbg:
 	$(MAKE) GCC_OPTS="-D DBG -g -fsanitize=address" build
