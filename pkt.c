@@ -1885,7 +1885,7 @@ void set_ssht() {
 			"/sbin/ss"
 		};
 
-		for(int i = 0; i < sizeof(paths); i++) {
+		for(int i = 0; i < sizeof(paths)/sizeof(*paths); i++) {
 			/* 
 			 * -t = tcp
 			 * -u = udp
